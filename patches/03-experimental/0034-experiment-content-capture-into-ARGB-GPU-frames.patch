@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Xe Chromium Patches <noreply@xe.invalid>
+From: Xe Chromium Patches <luke@agent54.org>
 Date: Sun, 22 Nov 2026 13:30:43 +0000
 Subject: [PATCH 34/50] experiment: content capture into ARGB GPU frames (ContentCaptureLetCapturerPickFormat:format/argb)
 

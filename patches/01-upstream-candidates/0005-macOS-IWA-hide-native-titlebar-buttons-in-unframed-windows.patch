@@ -1,5 +1,5 @@
 From d42025414688ea84944f8502153c770196fb2018 Mon Sep 17 00:00:00 2001
-From: Xe Chromium Patches <noreply@xe.invalid>
+From: Xe Chromium Patches <luke@agent54.org>
 Date: Wed, 23 Sep 2026 06:12:52 +0000
 Subject: [PATCH 5/50] macOS IWA: hide native titlebar buttons in unframed windows
 

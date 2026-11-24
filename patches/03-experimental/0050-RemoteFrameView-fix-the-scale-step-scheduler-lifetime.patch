@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Xe Chromium Patches <noreply@xe.invalid>
+From: Xe Chromium Patches <luke@agent54.org>
 Date: Mon, 23 Nov 2026 01:03:46 +0000
 Subject: [PATCH 50/50] RemoteFrameView: fix the scale step scheduler lifetime, near-natural bound and recheck timers
 

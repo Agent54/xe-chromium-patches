@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Xe Chromium Patches <noreply@xe.invalid>
+From: Xe Chromium Patches <luke@agent54.org>
 Date: Sun, 22 Nov 2026 19:24:19 +0000
 Subject: [PATCH 23/50] direct route: sync tokens correct with and without automatic token management
 

@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Xe Chromium Patches <noreply@xe.invalid>
+From: Xe Chromium Patches <luke@agent54.org>
 Date: Sun, 22 Nov 2026 14:44:54 +0000
 Subject: [PATCH 32/50] direct route hardening: hidden guests also when the source starts hidden
 

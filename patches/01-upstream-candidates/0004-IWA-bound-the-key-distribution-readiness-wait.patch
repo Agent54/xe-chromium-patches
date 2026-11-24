@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Xe Chromium Patches <noreply@xe.invalid>
+From: Xe Chromium Patches <luke@agent54.org>
 Date: Sat, 11 Jul 2026 03:12:46 +0000
 Subject: [PATCH 4/50] IWA: bound the key distribution readiness wait
 
@@ -7,9 +7,11 @@ Isolated Web App installs deadlock in builds where the IwaKeyDistribution
 component can never be fetched: OnBestEffortRuntimeDataReady() waits on the
 component, and the existing 15 s fallback in MaybeQueueComponentUpdate() was
 only reachable after any_data_ready_ signaled, which never happens without a
-component. When no component data is ready, queue the on-demand update
-immediately and arm the same 15 s fallback, so the gate always releases in
-bounded time.
+component. When no component data is ready, post the on-demand update as a
+task right away (instead of waiting on any_data_ready_) so it arms the same
+15 s fallback, and the gate always releases in bounded time. The update is
+posted rather than called so the updater callback never runs re-entrantly
+inside OnBestEffortRuntimeDataReady().
 
 Trust semantics:
 - Signed web bundle signature verification is untouched: its consumers
@@ -24,26 +26,37 @@ Trust semantics:
   queued and can deliver data). The gate fails open on the availability of
   the trust component, never on signatures.
 
-Test: SignalsAfterFallbackWhenNoComponentLoads (mock time): one immediate
-update request, the gate is not signaled early, and is signaled at +15 s.
+Test: SignalsAfterFallbackWhenNoComponentLoads (mock time): no update
+request inside the call, exactly one once the posted task runs, the gate is
+not signaled before +15 s, and is signaled at +15 s.
 ---
-diff --git a/chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.cc b/chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.cc
---- a/chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.cc
-+++ b/chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.cc
-@@ -507,6 +507,12 @@ void IwaKeyDistributionInfoProvider::
-     return;
+diff --git a/components/webapps/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.cc b/components/webapps/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.cc
+--- a/components/webapps/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.cc
++++ b/components/webapps/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.cc
+@@ -507,6 +507,22 @@ void IwaKeyDistributionInfoProvider::
+         kIwaComponentBestEffortWaitOutcome,
+         IwaComponentBestEffortWaitOutcome::kNoWaitComponentAlreadyReady);
    }
-   maybe_queue_component_update_posted_ = true;
 +
 +  if (!any_data_ready_.is_signaled()) {
-+    MaybeQueueComponentUpdate();
++    // No component data has loaded yet, and in builds that cannot fetch the
++    // component none ever will. Queue the update (and arm its fallback) now
++    // instead of waiting on `any_data_ready_`, so that
++    // `maybe_downloaded_data_ready_` is always signaled in bounded time. Post
++    // it rather than calling it, so the update callback never runs
++    // re-entrantly inside OnBestEffortRuntimeDataReady().
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(
++            &IwaKeyDistributionInfoProvider::MaybeQueueComponentUpdate,
++            base::Unretained(this)));
 +    return;
 +  }
 +
    any_data_ready_.Post(
        FROM_HERE,
        base::BindOnce(&IwaKeyDistributionInfoProvider::MaybeQueueComponentUpdate,
-@@ -515,7 +521,6 @@ void IwaKeyDistributionInfoProvider::
+@@ -515,7 +531,6 @@ void IwaKeyDistributionInfoProvider::
  
  void IwaKeyDistributionInfoProvider::MaybeQueueComponentUpdate() {
    CHECK(maybe_queue_component_update_posted_);
@@ -51,10 +64,10 @@ diff --git a/chrome/browser/web_applications/isolated_web_apps/key_distribution/
    CHECK(queue_on_demand_update_);
  
    if (!component_ || component_->is_preloaded) {
-diff --git a/chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.h b/chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.h
---- a/chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.h
-+++ b/chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.h
-@@ -89,9 +89,8 @@ class IwaKeyDistributionInfoProvider :
+diff --git a/components/webapps/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.h b/components/webapps/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.h
+--- a/components/webapps/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.h
++++ b/components/webapps/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider.h
+@@ -89,9 +89,8 @@ class COMPONENT_EXPORT(ISOLATED_WEB_APPS) IwaKeyDistributionInfoProvider
    //  * Immediately if the kIwaKeyDistributionComponent flag is disabled
    //  * Upon component loading if the available component is downloaded and not
    //    preloaded
@@ -65,14 +78,14 @@ diff --git a/chrome/browser/web_applications/isolated_web_apps/key_distribution/
 +  //  updater is unable to provide downloaded component data.
    base::OneShotEvent& OnBestEffortRuntimeDataReady() override;
  
-   // ChromeIwaRuntimeDataProvider:
-@@ -168,16 +167,15 @@ class IwaKeyDistributionInfoProvider :
+   // IwaRuntimeDataProvider:
+@@ -161,16 +160,15 @@ class COMPONENT_EXPORT(ISOLATED_WEB_APPS) IwaKeyDistributionInfoProvider
      Data data;
    };
  
 -  // Posts `MaybeQueueComponentUpdate()` onto `any_data_ready_` once.
-+  // Calls `MaybeQueueComponentUpdate()` immediately if no component data is
-+  // ready, or posts it onto `any_data_ready_`, at most once.
++  // Posts `MaybeQueueComponentUpdate()` at most once: as a task right away if
++  // no component data is ready yet, otherwise onto `any_data_ready_`.
    void PostMaybeQueueComponentUpdateOnceOnDataReady();
  
    // Queues a component update request with a fallback.
@@ -86,7 +99,7 @@ diff --git a/chrome/browser/web_applications/isolated_web_apps/key_distribution/
    void MaybeQueueComponentUpdate();
  
    void OnKeyDistributionDataFileLoaded(
-@@ -201,8 +199,7 @@ class IwaKeyDistributionInfoProvider :
+@@ -195,8 +193,7 @@ class COMPONENT_EXPORT(ISOLATED_WEB_APPS) IwaKeyDistributionInfoProvider
    base::OneShotEvent any_data_ready_;
  
    // Will be signalled either if a downloaded component version is loaded or in
@@ -96,14 +109,13 @@ diff --git a/chrome/browser/web_applications/isolated_web_apps/key_distribution/
    base::OneShotEvent maybe_downloaded_data_ready_;
  
    bool maybe_queue_component_update_posted_ = false;
-diff --git a/chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider_unittest.cc b/chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider_unittest.cc
---- a/chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider_unittest.cc
-+++ b/chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider_unittest.cc
-@@ -511,7 +511,43 @@ auto HoldsDownloadedComponentData() {
- }
+diff --git a/components/webapps/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider_unittest.cc b/components/webapps/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider_unittest.cc
+--- a/components/webapps/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider_unittest.cc
++++ b/components/webapps/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider_unittest.cc
+@@ -573,6 +573,50 @@ auto HoldsDownloadedComponentData() {
  
  }  // namespace
-+
+ 
 +class IwaKeyDistributionInfoProviderNoComponentReadinessTest
 +    : public testing::Test {
 + public:
@@ -129,17 +141,25 @@ diff --git a/chrome/browser/web_applications/isolated_web_apps/key_distribution/
 +        ++*update_requests;
 +      },
 +      &update_requests));
- 
++
 +  bool was_called = false;
 +  key_provider.OnBestEffortRuntimeDataReady().Post(
 +      FROM_HERE, base::BindLambdaForTesting([&] { was_called = true; }));
 +
++  // The update request is posted, not made from inside
++  // OnBestEffortRuntimeDataReady().
++  EXPECT_EQ(update_requests, 0);
++  task_environment().RunUntilIdle();
 +  EXPECT_EQ(update_requests, 1);
 +  EXPECT_FALSE(was_called);
-+  task_environment().FastForwardBy(base::Seconds(15));
++
++  task_environment().FastForwardBy(base::Seconds(15) - base::Milliseconds(1));
++  EXPECT_FALSE(was_called);
++  task_environment().FastForwardBy(base::Milliseconds(1));
 +  EXPECT_TRUE(was_called);
++  EXPECT_EQ(update_requests, 1);
 +}
 +
- class IwaIwaKeyDistributionInfoProviderReadinessTest
+ class IwaKeyDistributionInfoProviderReadinessTest
      : public ::testing::TestWithParam<bool> {
   public:

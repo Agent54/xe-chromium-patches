@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Xe Chromium Patches <noreply@xe.invalid>
+From: Xe Chromium Patches <luke@agent54.org>
 Date: Sun, 22 Nov 2026 08:54:30 +0000
 Subject: [PATCH 1/50] controlledframe/guest view: keep guest across moveBefore() (connectedMoveCallback)
 

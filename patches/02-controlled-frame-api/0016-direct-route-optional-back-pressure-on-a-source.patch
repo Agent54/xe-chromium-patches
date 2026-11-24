@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Xe Chromium Patches <noreply@xe.invalid>
+From: Xe Chromium Patches <luke@agent54.org>
 Date: Sun, 22 Nov 2026 16:27:33 +0000
 Subject: [PATCH 16/50] direct route: optional back-pressure on a source
 

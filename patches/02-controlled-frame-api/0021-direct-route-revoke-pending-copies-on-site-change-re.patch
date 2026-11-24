@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Xe Chromium Patches <noreply@xe.invalid>
+From: Xe Chromium Patches <luke@agent54.org>
 Date: Sun, 22 Nov 2026 19:19:17 +0000
 Subject: [PATCH 21/50] direct route: revoke pending copies on site change; re-check ownership on completion
 

@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Xe Chromium Patches <noreply@xe.invalid>
+From: Xe Chromium Patches <luke@agent54.org>
 Date: Mon, 23 Nov 2026 00:40:18 +0000
 Subject: [PATCH 46/50] Experiment: shorter hold for upward compositing-scale steps (kShortHoldForUpwardScaleSteps)
 

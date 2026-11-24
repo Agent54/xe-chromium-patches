@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Xe Chromium Patches <noreply@xe.invalid>
+From: Xe Chromium Patches <luke@agent54.org>
 Date: Sun, 22 Nov 2026 20:18:03 +0000
 Subject: [PATCH 28/50] controlledframe.setFrameRate(): validate the rate and clamp the throttle interval
 

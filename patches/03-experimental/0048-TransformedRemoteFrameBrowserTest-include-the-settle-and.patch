@@ -1,5 +1,5 @@
 From 97435c719166070069d0d339eeea9c4e46f3acbb Mon Sep 17 00:00:00 2001
-From: Xe Chromium Patches <noreply@xe.invalid>
+From: Xe Chromium Patches <luke@agent54.org>
 Date: Mon, 23 Nov 2026 01:03:40 +0000
 Subject: [PATCH 48/50] TransformedRemoteFrameBrowserTest: add experimental zoom,
  settle, and will-change parameter

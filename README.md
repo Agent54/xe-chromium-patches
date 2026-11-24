@@ -20,9 +20,9 @@ License: BSD-3-Clause (see `LICENSE`). Base: see `BASE_VERSION` (Chromium 160.0.
     gclient sync -D
     git am --3way $(sed 's#^#/path/to/xe-chromium-patches/patches/#' /path/to/xe-chromium-patches/patches/series)
 
-**Status: the series has not been apply-tested against a real checkout.** It was reordered and edited
-using a sparse simulation only. Expect to resolve a few context offsets; report anything that fails
-`git am`.
+**Status:** all 50 patches apply in `series` order to `CHROMIUM_BASE_COMMIT` with no offsets
+(`git apply --cached` against the base tree, plus `git mailinfo` on every header). The series has not
+been compiled or run on 160.0.8176.0 yet; report anything that fails `git am`.
 
 ## Build
 
@@ -48,7 +48,6 @@ export; the harness is not runnable until those are added. Design notes and resu
 
 ## Known gaps
 
-- Patch 0004 still targets Chromium 150 paths (`chrome/browser/web_applications/isolated_web_apps/key_distribution/iwa_key_distribution_info_provider*`) pending path rebase onto Chromium 160, and still calls `MaybeQueueComponentUpdate` synchronously.
-- Patch 0005 is re-anchored cleanly onto stock Chromium 160.0.8176.0 (verified via `git apply --check`), but its unit/browser tests still need compile+run verification on Chromium 160.
+- Patches 0004 and 0005 apply cleanly to stock Chromium 160.0.8176.0 (0004 now targets `components/webapps/isolated_web_apps/key_distribution/` and posts `MaybeQueueComponentUpdate` as a task), but their unit/browser tests still need compile+run verification on Chromium 160.
 - `GuestFrameTextureSource` is still exposed as a global constructor to Window.
 - macOS behavior of the unified series is untested (0022-0030 were Linux-only before).
