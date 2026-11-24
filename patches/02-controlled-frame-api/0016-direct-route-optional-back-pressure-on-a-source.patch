@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 16:27:33 +0000
+Subject: [PATCH 16/50] direct route: optional back-pressure on a source
+
+createTextureSource({backpressure: true}): every 500 ms the browser-side
+source sets its guest's BeginFrame interval (SetFrameSinkThrottleInterval)
+to 1.5x the rate at which copies were requested (i.e. frames consumed), at
+least 5 fps, cleared when that reaches ~full rate, when the guest's frame
+sink changes, and when the source goes away. A reader that stops reading
+leaves its guest at 5 fps until it reads again (ramps back in ~2 s) or
+the source is closed.
+---
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+--- a/content/browser/renderer_host/guest_frame_texture_host.cc
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "content/browser/renderer_host/guest_frame_texture_host.h"
+ 
++#include <algorithm>
+ #include <memory>
+ #include <utility>
+ #include <vector>
+@@ -11,6 +12,7 @@
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "base/timer/timer.h"
+ #include "base/unguessable_token.h"
+ #include "components/viz/common/frame_sinks/blit_request.h"
+ #include "components/viz/common/frame_sinks/copy_output_request.h"
+@@ -53,15 +55,24 @@
+       gfx::Size size,
+       scoped_refptr<viz::RasterContextProvider> context_provider,
+       std::vector<scoped_refptr<gpu::ClientSharedImage>> images,
+-      base::ScopedClosureRunner capture_handle)
++      base::ScopedClosureRunner capture_handle,
++      bool backpressure)
+       : host_(std::move(host)),
+         guest_frame_(guest_frame),
+         size_(size),
+         context_provider_(std::move(context_provider)),
+         images_(std::move(images)),
+-        capture_handle_(std::move(capture_handle)) {}
++        capture_handle_(std::move(capture_handle)) {
++    if (backpressure) {
++      backpressure_timer_.Start(
++          FROM_HERE, kBackpressurePeriod,
++          base::BindRepeating(&GuestFrameTextureSourceHostImpl::UpdateBackpressure,
++                              base::Unretained(this)));
++    }
++  }
+ 
+   ~GuestFrameTextureSourceHostImpl() override {
++    SetGuestInterval(base::TimeDelta());
+     // The renderer holds its own imported references; ours go away here.
+     gpu::SyncToken token = context_provider_->SharedImageInterface()
+                                ->GenUnverifiedSyncToken();
+@@ -78,6 +89,7 @@
+       std::move(callback).Run(false, gpu::SyncToken());
+       return;
+     }
++    ++requests_in_period_;
+     Issue(index, release_sync_token, std::move(callback), /*retries=*/2);
+   }
+ 
+@@ -136,6 +148,45 @@
+     }
+     std::move(callback).Run(true, result->sync_token());
+   }
++
++  // Back-pressure: every period, set the guest's BeginFrame interval to 1.5x
++  // the rate at which copies were requested (copies are requested as the
++  // reader frees slots, i.e. at the consumption rate), at least 5 fps;
++  // cleared when that reaches ~full rate and when the source goes away. A
++  // reader that stops reading leaves its guest at 5 fps until it reads again
++  // (then it ramps up by 1.5x per period) or the source is closed.
++  void UpdateBackpressure() {
++    const double rate = requests_in_period_ / kBackpressurePeriod.InSecondsF();
++    requests_in_period_ = 0;
++    const double target = std::max(5.0, rate * 1.5);
++    SetGuestInterval(base::Seconds(1.0 / target));
++  }
++
++  void SetGuestInterval(base::TimeDelta interval) {
++    RenderWidgetHostViewChildFrame* view =
++        host_ ? host_->FindOwnedGuestView(guest_frame_) : nullptr;
++    const viz::FrameSinkId sink =
++        view ? view->GetFrameSinkId() : viz::FrameSinkId();
++    if (throttled_sink_.is_valid() && throttled_sink_ != sink) {
++      GetHostFrameSinkManager()->SetFrameSinkThrottleInterval(
++          throttled_sink_, base::TimeDelta());
++      throttled_sink_ = viz::FrameSinkId();
++    }
++    if (!sink.is_valid() || !GetHostFrameSinkManager()) {
++      return;
++    }
++    if (interval.is_zero() && !throttled_sink_.is_valid()) {
++      return;
++    }
++    GetHostFrameSinkManager()->SetFrameSinkThrottleInterval(sink, interval);
++    throttled_sink_ = interval.is_zero() ? viz::FrameSinkId() : sink;
++  }
++
++  static constexpr base::TimeDelta kBackpressurePeriod =
++      base::Milliseconds(500);
++  base::RepeatingTimer backpressure_timer_;
++  int requests_in_period_ = 0;
++  viz::FrameSinkId throttled_sink_;
+ 
+   base::WeakPtr<GuestFrameTextureHost> host_;
+   const blink::RemoteFrameToken guest_frame_;
+@@ -231,6 +282,7 @@
+     const gfx::Size& size,
+     uint32_t pool_size,
+     bool webgpu,
++    bool backpressure,
+     mojo::PendingReceiver<blink::mojom::GuestFrameTextureSourceHost> source,
+     CreateSourceCallback callback) {
+   auto refuse = [&]() {
+@@ -291,7 +343,7 @@
+   sources_.Add(std::make_unique<GuestFrameTextureSourceHostImpl>(
+                    weak_factory_.GetWeakPtr(), guest_frame, size,
+                    std::move(context_provider), std::move(images),
+-                   std::move(capture_handle)),
++                   std::move(capture_handle), backpressure),
+                std::move(source));
+   std::move(callback).Run(std::move(exported), creation_token);
+ }
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.h b/content/browser/renderer_host/guest_frame_texture_host.h
+--- a/content/browser/renderer_host/guest_frame_texture_host.h
++++ b/content/browser/renderer_host/guest_frame_texture_host.h
+@@ -42,6 +42,7 @@
+       const gfx::Size& size,
+       uint32_t pool_size,
+       bool webgpu,
++      bool backpressure,
+       mojo::PendingReceiver<blink::mojom::GuestFrameTextureSourceHost> source,
+       CreateSourceCallback callback) override;
+ 
+diff --git a/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom b/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
+--- a/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
++++ b/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
+@@ -21,8 +21,11 @@
+   // a guest attached to a child frame of the calling frame. While the source
+   // is alive the guest is treated as being captured (kept rendering and
+   // composited even if hidden).
++  // If `backpressure`, the guest's frame rate is held near the rate at which
++  // this source requests copies (i.e. consumes frames), and released when
++  // the source goes away.
+   CreateSource(RemoteFrameToken guest_frame, gfx.mojom.Size size,
+-               uint32 pool_size, bool webgpu,
++               uint32 pool_size, bool webgpu, bool backpressure,
+                pending_receiver<GuestFrameTextureSourceHost> source)
+       => (array<gpu.mojom.ExportedSharedImage> images,
+           gpu.mojom.SyncToken creation_sync_token);
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+@@ -86,7 +86,7 @@
+       host_.BindNewPipeAndPassReceiver(task_runner));
+   host_->CreateSource(
+       token_, gfx::Size(width_, height_), pool_size_, init->webgpu(),
+-      source_.BindNewPipeAndPassReceiver(task_runner),
++      init->backpressure(), source_.BindNewPipeAndPassReceiver(task_runner),
+       blink::BindOnce(&GuestFrameTextureSource::OnSourceCreated,
+                       WrapWeakPersistent(this)));
+   source_.set_disconnect_handler(blink::BindOnce(
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
+@@ -18,4 +18,7 @@
+   [EnforceRange] unsigned long pipelineDepth = 2;
+   // Also request WebGPU read usage on the shared images.
+   boolean webgpu = false;
++  // Hold the guest's own frame rate near the rate at which this source's
++  // frames are read (released when the source is closed or collected).
++  boolean backpressure = false;
+ };

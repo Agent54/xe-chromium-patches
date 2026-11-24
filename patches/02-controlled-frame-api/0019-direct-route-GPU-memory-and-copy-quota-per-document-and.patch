@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 18:39:50 +0000
+Subject: [PATCH 19/50] direct route: GPU memory and copy quota per document and process
+
+Each Blink source binds its own GuestFrameTextureHost, so the former limit
+of 256 sources per host bounded nothing. Usage is now kept per document (a
+DocumentUserData shared by all its hosts and sources) and per renderer
+process: at most 256 MiB of images per source, 1 GiB per document and 2 GiB
+per process, 256 sources per document, and 512 / 1024 copies in flight per
+document / process. A source may have only one copy in flight per slot.
+Bytes are counted from allocation until the browser drops the images.
+
+Test: ControlledFrameTextureSourceTest.Quota (a 512 MiB source is refused;
+the ninth 127 MiB source of one document is refused).
+---
+diff --git a/chrome/browser/controlled_frame/controlled_frame_apitest.cc b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+--- a/chrome/browser/controlled_frame/controlled_frame_apitest.cc
++++ b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+@@ -1062,6 +1062,51 @@
+   EXPECT_FALSE(content::CanReadGuestFrameTextureForTesting(child, guest_main));
+ }
+ 
++// The limits on GPU memory hold for a document across all of its sources
++// (each source binds its own host in the browser).
++IN_PROC_BROWSER_TEST_F(ControlledFrameTextureSourceTest, Quota) {
++  web_app::IsolatedWebAppUrlInfo url_info =
++      CreateAndInstallEmptyApp(web_app::ManifestBuilder());
++  content::RenderFrameHost* app_frame = OpenApp(url_info.app_id());
++  extensions::WebViewGuest* guest = CreateSizedFrame(
++      app_frame, embedded_https_test_server().GetURL("/index.html"));
++  ASSERT_TRUE(guest);
++  ASSERT_TRUE(content::ExecJs(guest->GetGuestMainFrame(), R"(
++    document.body.innerHTML = '';
++    let flip = false;
++    (function paint() {
++      flip = !flip;
++      document.documentElement.style.background =
++          flip ? 'rgb(0, 255, 0)' : 'rgb(0, 254, 0)';
++      requestAnimationFrame(paint);
++    })();)"));
++  EXPECT_EQ("big refused; 8 ok, then refused", content::EvalJs(app_frame, R"(
++    (async () => {
++      const f = document.querySelector('controlledframe');
++      const first = async (src) => {
++        const vf = await src.read();
++        if (!vf) return false;
++        vf.close();
++        return true;
++      };
++      // 8192x8192 x 4 bytes x 2 images = 512 MiB: over the 256 MiB limit
++      // for one source.
++      const big = await f.createTextureSource(
++          {width: 8192, height: 8192, poolSize: 2, maxInFlight: 1});
++      if (await first(big)) return 'big accepted';
++      // 1920x1080 x 4 bytes x 16 images = 126.6 MiB each; 1 GiB for the
++      // document, so the ninth is refused.
++      window.sources = [];
++      for (let i = 0; i < 12; i++) {
++        const s = await f.createTextureSource(
++            {width: 1920, height: 1080, poolSize: 16});
++        if (!(await first(s))) return `big refused; ${i} ok, then refused`;
++        sources.push(s);
++      }
++      return 'never refused';
++    })();)"));
++}
++
+ // A pending read resolves with null when the guest is destroyed or its
+ // renderer crashes, and continues with the new page when the guest navigates
+ // cross-site.
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+--- a/content/browser/renderer_host/guest_frame_texture_host.cc
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -5,12 +5,16 @@
+ #include "content/browser/renderer_host/guest_frame_texture_host.h"
+ 
+ #include <algorithm>
++#include <map>
++#include <tuple>
+ #include <memory>
+ #include <utility>
+ #include <vector>
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/memory/ref_counted.h"
++#include "base/no_destructor.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/timer/timer.h"
+ #include "base/unguessable_token.h"
+@@ -28,6 +32,8 @@
+ #include "content/browser/renderer_host/render_frame_proxy_host.h"
+ #include "content/browser/renderer_host/render_widget_host_view_child_frame.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
++#include "content/public/browser/document_user_data.h"
++#include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/content_browser_client.h"
+ #include "content/public/common/content_client.h"
+ #include "gpu/command_buffer/client/client_shared_image.h"
+@@ -47,6 +53,114 @@
+   return factory->GetContextFactory()->SharedMainThreadRasterContextProvider();
+ }
+ 
++// What one document and one renderer process can make the browser allocate
++// and keep in flight, over all their sources (each Blink source binds its own
++// GuestFrameTextureHost, so these are kept outside it). Images count from
++// allocation until the browser drops them (when the source goes away, or as
++// the renderer gives up slots after Stop(); see below).
++constexpr uint64_t kMaxBytesPerSource = uint64_t{256} << 20;
++constexpr uint64_t kMaxBytesPerDocument = uint64_t{1024} << 20;
++constexpr uint64_t kMaxBytesPerProcess = uint64_t{2048} << 20;
++constexpr uint32_t kMaxSourcesPerDocument = 256;
++constexpr uint32_t kMaxOutstandingPerDocument = 512;
++constexpr uint32_t kMaxOutstandingPerProcess = 1024;
++
++struct Usage {
++  uint64_t bytes = 0;
++  uint32_t sources = 0;
++  uint32_t outstanding = 0;
++  bool empty() const { return !bytes && !sources && !outstanding; }
++};
++
++std::map<int, Usage>& ProcessUsages() {
++  static base::NoDestructor<std::map<int, Usage>> usages;
++  return *usages;
++}
++
++// Usage of one document, shared by its GuestFrameTextureHosts and their
++// sources (which can outlive the document's user data briefly), and of the
++// document's process.
++class UsageAccount : public base::RefCounted<UsageAccount> {
++ public:
++  explicit UsageAccount(int process_id) : process_id_(process_id) {}
++
++  bool TryAddSource(uint64_t bytes) {
++    Usage& process = ProcessUsages()[process_id_];
++    if (bytes > kMaxBytesPerSource ||
++        document_.sources + 1 > kMaxSourcesPerDocument ||
++        document_.bytes + bytes > kMaxBytesPerDocument ||
++        process.bytes + bytes > kMaxBytesPerProcess) {
++      MaybeErase();
++      return false;
++    }
++    document_.sources += 1;
++    process.sources += 1;
++    document_.bytes += bytes;
++    process.bytes += bytes;
++    return true;
++  }
++  void RemoveSource() {
++    document_.sources -= 1;
++    ProcessUsages()[process_id_].sources -= 1;
++    MaybeErase();
++  }
++  void RemoveBytes(uint64_t bytes) {
++    document_.bytes -= bytes;
++    ProcessUsages()[process_id_].bytes -= bytes;
++    MaybeErase();
++  }
++  bool TryBeginRequest() {
++    Usage& process = ProcessUsages()[process_id_];
++    if (document_.outstanding + 1 > kMaxOutstandingPerDocument ||
++        process.outstanding + 1 > kMaxOutstandingPerProcess) {
++      MaybeErase();
++      return false;
++    }
++    document_.outstanding += 1;
++    process.outstanding += 1;
++    return true;
++  }
++  void EndRequests(uint32_t count) {
++    document_.outstanding -= count;
++    ProcessUsages()[process_id_].outstanding -= count;
++    MaybeErase();
++  }
++
++ private:
++  friend class base::RefCounted<UsageAccount>;
++  ~UsageAccount() = default;
++  void MaybeErase() {
++    auto it = ProcessUsages().find(process_id_);
++    if (it != ProcessUsages().end() && it->second.empty()) {
++      ProcessUsages().erase(it);
++    }
++  }
++  const int process_id_;
++  Usage document_;
++};
++
++class DocumentUsage : public DocumentUserData<DocumentUsage> {
++ public:
++  ~DocumentUsage() override = default;
++  const scoped_refptr<UsageAccount>& account() const { return account_; }
++
++ private:
++  explicit DocumentUsage(RenderFrameHost* rfh)
++      : DocumentUserData(rfh),
++        account_(base::MakeRefCounted<UsageAccount>(
++            rfh->GetProcess()->GetDeprecatedID())) {}
++  friend DocumentUserData;
++  DOCUMENT_USER_DATA_KEY_DECL();
++  const scoped_refptr<UsageAccount> account_;
++};
++
++DOCUMENT_USER_DATA_KEY_IMPL(DocumentUsage);
++
++uint64_t ImageBytes(const gfx::Size& size) {
++  return uint64_t{4} * static_cast<uint64_t>(size.width()) *
++         static_cast<uint64_t>(size.height());
++}
++
+ // One source: a ring of browser-allocated shared images for one guest of one
+ // document. Lives while the renderer keeps its remote (or the document).
+ class GuestFrameTextureSourceHostImpl
+@@ -60,7 +174,8 @@
+       std::vector<scoped_refptr<gpu::ClientSharedImage>> images,
+       base::ScopedClosureRunner capture_handle,
+       bool backpressure,
+-      double max_frame_rate)
++      double max_frame_rate,
++      scoped_refptr<UsageAccount> account)
+       : host_(std::move(host)),
+         guest_frame_(guest_frame),
+         size_(size),
+@@ -70,7 +185,9 @@
+         backpressure_(backpressure),
+         cap_interval_(max_frame_rate > 0
+                           ? base::Seconds(1.0 / max_frame_rate)
+-                          : base::TimeDelta()) {
++                          : base::TimeDelta()),
++        account_(std::move(account)),
++        in_flight_(images_.size(), false) {
+     SetGuestInterval(base::TimeDelta());
+     if (backpressure_ || cap_interval_.is_positive()) {
+       // Also re-applies the cap if the guest's frame sink changes.
+@@ -88,18 +205,28 @@
+     gpu::SyncToken token = context_provider_->SharedImageInterface()
+                                ->GenUnverifiedSyncToken();
+     for (auto& image : images_) {
+-      image->UpdateDestructionSyncToken(token);
++      if (image) {
++        image->UpdateDestructionSyncToken(token);
++        account_->RemoveBytes(ImageBytes(size_));
++      }
+     }
++    account_->EndRequests(static_cast<uint32_t>(
++        std::ranges::count(in_flight_, true)));
++    account_->RemoveSource();
+   }
+ 
+   // blink::mojom::GuestFrameTextureSourceHost:
+   void CopyNextFrame(uint32_t index,
+                      const gpu::SyncToken& release_sync_token,
+                      CopyNextFrameCallback callback) override {
+-    if (index >= images_.size()) {
++    // One copy per slot at a time, and a bound on copies in flight per
++    // document and process.
++    if (index >= images_.size() || in_flight_[index] ||
++        !account_->TryBeginRequest()) {
+       std::move(callback).Run(false, gpu::SyncToken());
+       return;
+     }
++    in_flight_[index] = true;
+     ++requests_in_period_;
+     Issue(index, release_sync_token, std::move(callback), /*retries=*/2);
+   }
+@@ -116,7 +243,7 @@
+     const gfx::Size source_size =
+         view ? view->GetCompositorViewportPixelSize() : gfx::Size();
+     if (!view || !view->IsSurfaceAvailableForCopy() || source_size.IsEmpty()) {
+-      std::move(callback).Run(false, gpu::SyncToken());
++      Reply(index, std::move(callback), false, gpu::SyncToken());
+       return;
+     }
+     auto request = std::make_unique<viz::CopyOutputRequest>(
+@@ -142,6 +269,18 @@
+         /*capture_exact_surface_id=*/false, base::TimeDelta());
+   }
+ 
++  // Every reply to CopyNextFrame() goes through here.
++  void Reply(uint32_t index,
++             CopyNextFrameCallback callback,
++             bool success,
++             const gpu::SyncToken& token) {
++    if (in_flight_[index]) {
++      in_flight_[index] = false;
++      account_->EndRequests(1);
++    }
++    std::move(callback).Run(success, token);
++  }
++
+   void OnCopied(uint32_t index,
+                 gpu::SyncToken release_sync_token,
+                 CopyNextFrameCallback callback,
+@@ -154,10 +293,10 @@
+         Issue(index, release_sync_token, std::move(callback), retries - 1);
+         return;
+       }
+-      std::move(callback).Run(false, gpu::SyncToken());
++      Reply(index, std::move(callback), false, gpu::SyncToken());
+       return;
+     }
+-    std::move(callback).Run(true, result->sync_token());
++    Reply(index, std::move(callback), true, result->sync_token());
+   }
+ 
+   // Back-pressure: every period, set the guest's BeginFrame interval to 1.5x
+@@ -216,6 +355,9 @@
+   base::ScopedClosureRunner capture_handle_;
+   const bool backpressure_ = false;
+   base::TimeDelta cap_interval_;
++  const scoped_refptr<UsageAccount> account_;
++  // Slots with a copy requested and not replied to.
++  std::vector<bool> in_flight_;
+   base::WeakPtrFactory<GuestFrameTextureSourceHostImpl> weak_factory_{this};
+ };
+ 
+@@ -317,11 +459,8 @@
+   auto refuse = [&]() {
+     std::move(callback).Run({}, gpu::SyncToken());
+   };
+-  // Per-document limit on sources (each holds `pool_size` images).
+-  constexpr size_t kMaxSourcesPerDocument = 256;
+   if (size.IsEmpty() || size.width() > 8192 || size.height() > 8192 ||
+-      pool_size < 2 || pool_size > 16 ||
+-      sources_.size() >= kMaxSourcesPerDocument) {
++      pool_size < 2 || pool_size > 16) {
+     return refuse();
+   }
+   WebContentsImpl* guest_contents = nullptr;
+@@ -337,6 +476,19 @@
+   if (!sii) {
+     return refuse();
+   }
++  // Counted against the document and its process, over all sources.
++  const scoped_refptr<UsageAccount>& account =
++      DocumentUsage::GetOrCreateForCurrentDocument(&render_frame_host())
++          ->account();
++  if (!account->TryAddSource(ImageBytes(size) * pool_size)) {
++    return refuse();
++  }
++  base::ScopedClosureRunner unreserve(base::BindOnce(
++      [](scoped_refptr<UsageAccount> account, uint64_t bytes) {
++        account->RemoveBytes(bytes);
++        account->RemoveSource();
++      },
++      account, ImageBytes(size) * pool_size));
+   // Written by the display compositor (blit destination of the copy); read by
+   // the renderer's WebGL/raster/WebGPU imports of the VideoFrame.
+   gpu::SharedImageUsageSet usage =
+@@ -372,8 +524,11 @@
+   sources_.Add(std::make_unique<GuestFrameTextureSourceHostImpl>(
+                    weak_factory_.GetWeakPtr(), guest_frame, size,
+                    std::move(context_provider), std::move(images),
+-                   std::move(capture_handle), backpressure, max_frame_rate),
++                   std::move(capture_handle), backpressure, max_frame_rate,
++                   account),
+                std::move(source));
++  // The source owns the reservation now.
++  std::ignore = unreserve.Release();
+   std::move(callback).Run(std::move(exported), creation_token);
+ }
+ 

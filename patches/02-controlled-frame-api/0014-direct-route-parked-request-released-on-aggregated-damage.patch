@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 16:02:52 +0000
+Subject: [PATCH 14/50] direct route: parked request released on aggregated damage
+
+- viz: a keyed copy request that finds no new content parks in its sink
+  and is released (one per key) from OnSurfaceAggregatedDamage, i.e. in the
+  aggregation that draws new content, right before the aggregator takes
+  the sink's copy requests: the copy is of the frame being drawn now, and
+  changes of embedded surfaces (e.g. a <video> layer, which never
+  activates a new frame of the guest's own sink) count. Redraws forced by
+  a request taken immediately do not count as new content.
+- Blink: pipelineDepth option, default 2 (one copy in flight plus one
+  parked), so there is always a request waiting when the guest changes;
+  0 keeps the adaptive depth. Rate cap with 4 ms tolerance, so a cap equal
+  to the display rate does not skip frames that arrive slightly early.
+- Browser: at most 256 sources per document.
+---
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+@@ -307,28 +307,6 @@
+     UpdateNeedsBeginFramesInternal();
+   }
+ 
+-  // Experiment: a new frame activated; release the requests that
+-  // waited for one. The surface has damage, so it is aggregated (and the
+-  // requests taken) in the next display frame that draws it.
+-  // Per key, release only the oldest waiting request, so that several
+-  // requests of one key get successive frames.
+-  ++activation_count_;
+-  if (!deferred_copy_output_requests_.empty()) {
+-    base::flat_set<base::UnguessableToken> released_keys;
+-    std::vector<std::unique_ptr<PendingCopyOutputRequest>> still_waiting;
+-    for (auto& request : deferred_copy_output_requests_) {
+-      const base::UnguessableToken& key =
+-          *request->copy_output_request->wait_for_new_frame_key();
+-      if (released_keys.insert(key).second) {
+-        last_copied_activation_by_key_[key] = activation_count_;
+-        copy_output_requests_.push_back(std::move(request));
+-      } else {
+-        still_waiting.push_back(std::move(request));
+-      }
+-    }
+-    deferred_copy_output_requests_ = std::move(still_waiting);
+-  }
+-
+   const CompositorFrameMetadata& active_frame_metadata =
+       surface->GetActiveFrameMetadata();
+   for (const auto& directive : active_frame_metadata.transition_directives) {
+@@ -413,5 +391,35 @@
+     base::TimeTicks expected_display_time) {
+   DCHECK(!damage_rect.IsEmpty());
++
++  // Experiment: the surface (or a surface embedded in it, e.g. a
++  // video) changed in this aggregation. Release the oldest parked keyed
++  // request of each key; the aggregator takes copy requests from this sink
++  // right after this call, so the copy is of the frame being drawn now.
++  // A redraw forced by a keyed request taken immediately (same frame, no
++  // other change) is not new content.
++  const uint64_t frame_index = surface->GetActiveFrameIndex();
++  const bool new_frame = frame_index != last_aggregated_frame_index_;
++  last_aggregated_frame_index_ = frame_index;
++  const bool forced_only = !new_frame && forced_redraw_pending_;
++  forced_redraw_pending_ = false;
++  if (!forced_only) {
++    ++damage_count_;
++  }
++  if (!forced_only && !deferred_copy_output_requests_.empty()) {
++    base::flat_set<base::UnguessableToken> released_keys;
++    std::vector<std::unique_ptr<PendingCopyOutputRequest>> still_waiting;
++    for (auto& request : deferred_copy_output_requests_) {
++      const base::UnguessableToken& key =
++          *request->copy_output_request->wait_for_new_frame_key();
++      if (released_keys.insert(key).second) {
++        last_copied_damage_by_key_[key] = damage_count_;
++        copy_output_requests_.push_back(std::move(request));
++      } else {
++        still_waiting.push_back(std::move(request));
++      }
++    }
++    deferred_copy_output_requests_ = std::move(still_waiting);
++  }
+ 
+   const gfx::Size& frame_size_in_pixels = frame.size_in_pixels();
+   if (aggregated_damage_callback_) {
+@@ -1470,14 +1478,15 @@
+     std::unique_ptr<PendingCopyOutputRequest> pending_copy_output_request) {
+   if (const auto& key = pending_copy_output_request->copy_output_request
+                             ->wait_for_new_frame_key()) {
+-    // Experiment: satisfied from a frame newer than the one the
+-    // previous request with this key copied: right away if one has activated
+-    // since (and no older request of this key is waiting), otherwise when the
+-    // next one activates.
+-    auto it = last_copied_activation_by_key_.find(*key);
++    // Experiment: satisfied from content newer than what the
++    // previous request with this key copied. If the sink has been drawn with
++    // new damage since (and no older request of this key is parked), copy
++    // right away (forces a redraw); otherwise park it until the next
++    // aggregation with damage (see OnSurfaceAggregatedDamage), which covers
++    // updates of embedded surfaces (video) too.
++    auto it = last_copied_damage_by_key_.find(*key);
+     const bool newer_available =
+-        it == last_copied_activation_by_key_.end() ||
+-        it->second < activation_count_;
++        it == last_copied_damage_by_key_.end() || it->second < damage_count_;
+     const bool key_waiting = std::ranges::any_of(
+         deferred_copy_output_requests_, [&](const auto& r) {
+           return *r->copy_output_request->wait_for_new_frame_key() == *key;
+@@ -1487,7 +1496,8 @@
+           std::move(pending_copy_output_request));
+       return;
+     }
+-    last_copied_activation_by_key_[*key] = activation_count_;
++    last_copied_damage_by_key_[*key] = damage_count_;
++    forced_redraw_pending_ = true;
+   }
+   copy_output_requests_.push_back(std::move(pending_copy_output_request));
+   if (last_activated_surface_id_.is_valid()) {
+@@ -1868,7 +1878,7 @@
+   // return an empty bitmap, signalling that the request is never satisfied.
+   copy_output_requests_.clear();
+   deferred_copy_output_requests_.clear();
+-  last_copied_activation_by_key_.clear();
++  last_copied_damage_by_key_.clear();
+ }
+ 
+ void CompositorFrameSinkSupport::SetLayerContextWantsBeginFrames(
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.h b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.h
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+@@ -457,13 +457,16 @@
+   // PendingCopyOutputRequest::local_surface_id is default initialized, then the
+   // next surface will take it regardless of its LocalSurfaceId.
+   std::vector<std::unique_ptr<PendingCopyOutputRequest>> copy_output_requests_;
+-  // Experiment: requests with wait_for_new_frame(), moved to
+-  // `copy_output_requests_` when the next frame activates.
++  // Experiment: keyed requests parked until the sink's surface is
++  // aggregated with new damage.
+   std::vector<std::unique_ptr<PendingCopyOutputRequest>>
+       deferred_copy_output_requests_;
+-  uint64_t activation_count_ = 0;
+-  base::flat_map<base::UnguessableToken, uint64_t>
+-      last_copied_activation_by_key_;
++  // Experiment: aggregations of this sink's surface with damage, and
++  // per wait key the value at its last copy.
++  uint64_t damage_count_ = 0;
++  uint64_t last_aggregated_frame_index_ = 0;
++  bool forced_redraw_pending_ = false;
++  base::flat_map<base::UnguessableToken, uint64_t> last_copied_damage_by_key_;
+ 
+   bool callback_received_begin_frame_ = true;
+   bool callback_received_receive_ack_ = true;
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+--- a/content/browser/renderer_host/guest_frame_texture_host.cc
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -236,8 +236,11 @@
+   auto refuse = [&]() {
+     std::move(callback).Run({}, gpu::SyncToken());
+   };
++  // Per-document limit on sources (each holds `pool_size` images).
++  constexpr size_t kMaxSourcesPerDocument = 256;
+   if (size.IsEmpty() || size.width() > 8192 || size.height() > 8192 ||
+-      pool_size < 2 || pool_size > 16) {
++      pool_size < 2 || pool_size > 16 ||
++      sources_.size() >= kMaxSourcesPerDocument) {
+     return refuse();
+   }
+   WebContentsImpl* guest_contents = nullptr;
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+@@ -77,6 +77,7 @@
+       height_(init->height()),
+       pool_size_(init->poolSize()),
+       max_in_flight_(init->maxInFlight()),
++      fixed_depth_(std::min(init->pipelineDepth(), init->maxInFlight())),
+       min_interval_(init->maxFrameRate() > 0
+                         ? base::Seconds(1.0 / init->maxFrameRate())
+                         : base::TimeDelta()) {
+@@ -164,9 +165,12 @@
+   // (the round trip includes waiting for the guest's next frame), up to
+   // `max_in_flight_`. With a short round trip a second copy would mostly be
+   // dropped as stale.
+-  const wtf_size_t depth = std::clamp<wtf_size_t>(
+-      1 + static_cast<wtf_size_t>(copy_round_trip_ / base::Hertz(30)), 1,
+-      max_in_flight_);
++  const wtf_size_t depth =
++      fixed_depth_ ? fixed_depth_
++                   : std::clamp<wtf_size_t>(
++                         1 + static_cast<wtf_size_t>(copy_round_trip_ /
++                                                     base::Hertz(30)),
++                         1, max_in_flight_);
+   while (true) {
+     const wtf_size_t copying = CountIn(SlotState::kCopying);
+     const wtf_size_t ready = CountIn(SlotState::kReady);
+@@ -178,17 +182,21 @@
+     if (it == slots_.end()) {
+       return;
+     }
+-    // Rate cap: issue no earlier than `min_interval_` after the previous one.
++    // Rate cap: issue no earlier than `min_interval_` after the previous one,
++    // with a tolerance of a quarter of a 60 Hz frame so that frames arriving
++    // a little early (display timing jitter) are not skipped when the cap
++    // equals the display rate.
+     const base::TimeTicks now = base::TimeTicks::Now();
++    const base::TimeDelta kTolerance = base::Milliseconds(4);
+     if (!last_issue_.is_null() && min_interval_.is_positive() &&
+-        now < last_issue_ + min_interval_) {
++        now < last_issue_ + min_interval_ - kTolerance) {
+       if (!pump_scheduled_) {
+         pump_scheduled_ = true;
+         execution_context_->GetTaskRunner(TaskType::kInternalMedia)
+             ->PostDelayedTask(FROM_HERE,
+                               blink::BindOnce(&GuestFrameTextureSource::Pump,
+                                               WrapWeakPersistent(this)),
+-                              last_issue_ + min_interval_ - now);
++                              last_issue_ + min_interval_ - kTolerance - now);
+       }
+       return;
+     }
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+@@ -91,6 +91,7 @@
+   uint32_t height_;
+   uint32_t pool_size_;
+   uint32_t max_in_flight_;
++  uint32_t fixed_depth_;
+   base::TimeDelta min_interval_;
+   base::TimeTicks last_issue_;
+   bool created_ = false;
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
+@@ -12,6 +12,10 @@
+   [EnforceRange] unsigned long poolSize = 4;
+   // Copies kept in flight ahead of read() (pipelining), at most poolSize - 1.
+   [EnforceRange] unsigned long maxInFlight = 2;
++  // Copies kept requested at a time: 2 = one being copied/delivered plus one
++  // parked in viz for the guest's next change (default); 1 = one at a time;
++  // 0 = adaptive up to maxInFlight.
++  [EnforceRange] unsigned long pipelineDepth = 2;
+   // Also request WebGPU read usage on the shared images.
+   boolean webgpu = false;
+ };

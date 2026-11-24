@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 20:14:47 +0000
+Subject: [PATCH 26/50] direct route: adaptive pipelining depth by default, measured on single copies, with hysteresis
+
+The default was a fixed depth of 2 (one copy delivered plus one parked in
+viz). At N = 32 that gave 30-37 ms latency after stage G (15 ms in five of
+six runs before); a fixed depth of 1 gives 15 ms but halves throughput at
+N = 64 (17.3 vs 32.1 fps per page).
+
+pipelineDepth now defaults to 0 (adaptive). The estimate uses only copies
+issued while no other copy was pending (a copy queued behind another
+measures the queue, not the path); going deeper needs the smoothed round
+trip to exceed each two-frame step by 4 ms, coming back needs it 4 ms
+below; a deeper depth is held 2 s, then depth 1 is probed with four
+single-copy samples, and a failed probe doubles the hold (up to 16 s).
+
+Release, Wayland, 640x360 guests, 3 runs: N = 16 58.0 fps/page, latency
+8 ms (one run 24 ms); N = 32 57.7, 15 ms; N = 64 28.8, 72 ms; 8 of 64
+animating 58.0, 6 ms. (Fixed depth 2: 57.9 / 59.7 / 32.1 fps, 8 / 30 /
+66 ms.)
+---
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+@@ -227,19 +227,10 @@
+   if (!created_ || ended_ || images_lost_ || !source_.is_bound()) {
+     return;
+   }
+-  // Keep up to `max_in_flight_` copies going while nothing is waiting to be
+-  // read (prefetch), plus one when a read is pending and nothing is ready.
+-  // Adaptive depth: one copy in flight, plus one for every two frame
+-  // intervals (at 60 Hz) beyond the first that a copy takes to come back
+-  // (the round trip includes waiting for the guest's next frame), up to
+-  // `max_in_flight_`. With a short round trip a second copy would mostly be
+-  // dropped as stale.
+-  const wtf_size_t depth =
+-      fixed_depth_ ? fixed_depth_
+-                   : std::clamp<wtf_size_t>(
+-                         1 + static_cast<wtf_size_t>(copy_round_trip_ /
+-                                                     base::Hertz(30)),
+-                         1, max_in_flight_);
++  MaybeProbeDepth();
++  // Keep up to `depth` copies requested at a time (see UpdateAdaptiveDepth()
++  // for the adaptive case).
++  const wtf_size_t depth = fixed_depth_ ? fixed_depth_ : adaptive_depth_;
+   while (true) {
+     const wtf_size_t copying = CountIn(SlotState::kCopying);
+     const wtf_size_t ready = CountIn(SlotState::kReady);
+@@ -272,6 +263,9 @@
+     last_issue_ = now;
+     const wtf_size_t index =
+         static_cast<wtf_size_t>(std::distance(slots_.begin(), it));
++    // A copy issued while none is pending measures the single-copy round
++    // trip; one issued behind another also measures the queueing.
++    it->issued_alone = CountIn(SlotState::kCopying) == 0;
+     it->state = SlotState::kCopying;
+     it->issued = now;
+     source_->CopyNextFrame(
+@@ -279,6 +273,62 @@
+         blink::BindOnce(&GuestFrameTextureSource::OnCopied,
+                         WrapWeakPersistent(this), index, ring_generation_));
+   }
++}
++
++// Adaptive pipelining depth. One copy at a time gives the lowest latency
++// while a copy comes back (including the wait for the guest's next frame)
++// within two frame intervals; when the round trip is longer, guest frames are
++// missed unless more copies are kept requested. Only copies issued while no
++// other was pending are measured (one queued behind another measures the
++// queue, not the path). Going deeper is held for `depth_hold_` (2 s, doubling
++// to 16 s); then depth 1 is probed with four single-copy samples, and kept
++// if the round trip stayed short. Thresholds have 4 ms of hysteresis around
++// each two-frame step.
++void GuestFrameTextureSource::UpdateAdaptiveDepth(base::TimeDelta rtt) {
++  copy_round_trip_ = single_samples_ == 0
++                         ? rtt
++                         : (copy_round_trip_ * 3 + rtt) / 4;
++  ++single_samples_;
++  const base::TimeTicks now = base::TimeTicks::Now();
++  const base::TimeDelta kStep = base::Hertz(30);
++  const base::TimeDelta kHysteresis = base::Milliseconds(4);
++  const wtf_size_t up = std::clamp<wtf_size_t>(
++      1 + static_cast<wtf_size_t>(
++              std::max(base::TimeDelta(), copy_round_trip_ - kHysteresis) /
++              kStep),
++      1, max_in_flight_);
++  if (adaptive_depth_ == 1) {
++    if (single_samples_ >= 4 && up > 1) {
++      if (probing_) {
++        // The probe failed: stay deep for longer before probing again.
++        depth_hold_ = std::min(depth_hold_ * 2, base::Seconds(16));
++      }
++      adaptive_depth_ = up;
++      depth_since_ = now;
++    } else if (probing_ && single_samples_ >= 4) {
++      depth_hold_ = base::Seconds(2);
++    }
++    if (single_samples_ >= 4) {
++      probing_ = false;
++    }
++    return;
++  }
++  const wtf_size_t down = std::clamp<wtf_size_t>(
++      1 + static_cast<wtf_size_t>((copy_round_trip_ + kHysteresis) / kStep), 1,
++      max_in_flight_);
++  if (up > adaptive_depth_ || down < adaptive_depth_) {
++    adaptive_depth_ = std::max<wtf_size_t>(down, 1);
++  }
++}
++
++void GuestFrameTextureSource::MaybeProbeDepth() {
++  if (fixed_depth_ || adaptive_depth_ == 1 ||
++      base::TimeTicks::Now() - depth_since_ < depth_hold_) {
++    return;
++  }
++  adaptive_depth_ = 1;
++  probing_ = true;
++  single_samples_ = 0;
+ }
+ 
+ gpu::SyncToken GuestFrameTextureSource::ReleaseTokenForCopy(Slot& slot) {
+@@ -334,12 +384,9 @@
+     MaybeReallocate();
+     return;
+   }
+-  // Includes the wait for the guest's next frame; that is what decides
+-  // whether another copy can be useful meanwhile.
+-  const base::TimeDelta rtt = base::TimeTicks::Now() - slot.issued;
+-  copy_round_trip_ = copy_round_trip_.is_zero()
+-                         ? rtt
+-                         : (copy_round_trip_ * 7 + rtt) / 8;
++  if (slot.issued_alone) {
++    UpdateAdaptiveDepth(base::TimeTicks::Now() - slot.issued);
++  }
+   slot.state = SlotState::kReady;
+   slot.ready_token = ready_token;
+   // With automatic sync token management, readers of the VideoFrame take
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+@@ -81,6 +81,7 @@
+     gpu::SyncToken ready_token;
+     uint64_t sequence = 0;
+     base::TimeTicks issued;
++    bool issued_alone = false;
+   };
+ 
+   void OnSourceCreated(Vector<gpu::ExportedSharedImage> images,
+@@ -132,9 +133,15 @@
+   uint32_t ring_generation_ = 0;
+   bool pump_scheduled_ = false;
+   uint64_t next_sequence_ = 1;
+-  // Smoothed time from requesting a copy to receiving it; more copies are
+-  // kept in flight only while it is longer than a frame.
++  // Adaptive depth (pipelineDepth 0), see UpdateAdaptiveDepth().
++  void UpdateAdaptiveDepth(base::TimeDelta single_copy_round_trip);
++  void MaybeProbeDepth();
+   base::TimeDelta copy_round_trip_;
++  int single_samples_ = 0;
++  wtf_size_t adaptive_depth_ = 1;
++  bool probing_ = false;
++  base::TimeTicks depth_since_;
++  base::TimeDelta depth_hold_ = base::Seconds(2);
+   Vector<Slot> slots_;
+   Member<ScriptPromiseResolver<IDLNullable<VideoFrame>>> pending_read_;
+ };
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
+@@ -12,10 +12,11 @@
+   [EnforceRange] unsigned long poolSize = 4;
+   // Copies kept in flight ahead of read() (pipelining), at most poolSize - 1.
+   [EnforceRange] unsigned long maxInFlight = 2;
+-  // Copies kept requested at a time: 2 = one being copied/delivered plus one
+-  // parked in viz for the guest's next change (default); 1 = one at a time;
+-  // 0 = adaptive up to maxInFlight.
+-  [EnforceRange] unsigned long pipelineDepth = 2;
++  // Copies kept requested at a time: 0 = adaptive up to maxInFlight
++  // (default: one at a time while copies come back quickly, more when they
++  // do not); 1 = one at a time; 2 = one being copied/delivered plus one
++  // parked in viz for the guest's next change.
++  [EnforceRange] unsigned long pipelineDepth = 0;
+   // Also request WebGPU read usage on the shared images.
+   boolean webgpu = false;
+   // Hold the guest's own frame rate near the rate at which this source's

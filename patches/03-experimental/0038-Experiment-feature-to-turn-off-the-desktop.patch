@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 18:03:51 +0000
+Subject: [PATCH 38/50] Experiment: feature to turn off the desktop VideoConferenceMatcher
+
+With two or more playing videos anywhere in a window, viz's
+VideoConferenceMatcher sets the display frame interval to the fastest
+video's interval and ignores all other animating content. A wall of
+<controlledframe> guests where two guests play 30 fps video therefore
+drops the whole window, including the embedder's WebGL scene, to 30 Hz.
+DesktopVideoConferenceFrameIntervalMatcher (enabled by default) lets it
+be turned off for measurement.
+---
+diff --git a/content/browser/compositor/viz_process_transport_factory.cc b/content/browser/compositor/viz_process_transport_factory.cc
+--- a/content/browser/compositor/viz_process_transport_factory.cc
++++ b/content/browser/compositor/viz_process_transport_factory.cc
+@@ -465,7 +465,8 @@
+     root_params->disable_frame_rate_limit = true;
+ 
+   // Enable VideoConferenceMatcher on desktop platforms.
+-  root_params->enable_video_conference_matcher = true;
++  root_params->enable_video_conference_matcher = base::FeatureList::IsEnabled(
++      features::kDesktopVideoConferenceFrameIntervalMatcher);
+ 
+ #if BUILDFLAG(IS_WIN)
+   const bool using_direct_composition = GpuDataManagerImpl::GetInstance()
+diff --git a/content/common/features.cc b/content/common/features.cc
+--- a/content/common/features.cc
++++ b/content/common/features.cc
+@@ -22,6 +22,13 @@
+              base::FEATURE_ENABLED_BY_DEFAULT);
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
++// Experiment (cf-experiments): desktop root compositor frame sinks use
++// viz::VideoConferenceMatcher, which lowers the display frame rate to the
++// fastest video's rate whenever two or more videos are playing, ignoring any
++// other animating content. Disable to keep the display at its full rate.
++BASE_FEATURE(kDesktopVideoConferenceFrameIntervalMatcher,
++             base::FEATURE_ENABLED_BY_DEFAULT);
++
+ // When enabled, Android events will include more metadata about the incoming
+ // events.
+ BASE_FEATURE(kAccessibilityExpandEventMetadata,
+diff --git a/content/common/features.h b/content/common/features.h
+--- a/content/common/features.h
++++ b/content/common/features.h
+@@ -20,5 +20,7 @@
+ #endif  // BUILDFLAG(IS_ANDROID)
+ CONTENT_EXPORT BASE_DECLARE_FEATURE(kAccessibilityExpandEventMetadata);
+ CONTENT_EXPORT BASE_DECLARE_FEATURE(
++    kDesktopVideoConferenceFrameIntervalMatcher);
++CONTENT_EXPORT BASE_DECLARE_FEATURE(
+     kAccessibilityExposeNonAtomicTextFieldChildren);
+ CONTENT_EXPORT BASE_DECLARE_FEATURE(kAllowContentInitiatedDataUrlNavigations);

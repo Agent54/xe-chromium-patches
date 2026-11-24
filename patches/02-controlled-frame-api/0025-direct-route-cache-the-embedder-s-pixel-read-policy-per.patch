@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 20:04:49 +0000
+Subject: [PATCH 25/50] direct route: cache the embedder's pixel-read policy per source
+
+The ownership check ran ContentBrowserClient::MayReadGuestFramePixels() twice
+per copy (issue and completion). The structural part (caller process, exact
+parent frame, outer delegate, guest WebContents) still runs every time; the
+embedder's answer is now cached per source and asked again when the guest
+WebContents found by the structural check changes, when the guest's main
+page changes site, or when the embedder reports a policy change through the
+new content::NotifyGuestFramePixelsPolicyChanged() (a global generation
+counter). Chrome calls it from a per-profile PrefChangeRegistrar on
+policy_prefs::kDisableScreenshots, installed on first use.
+
+Browser-process CPU at N = 32 (about 1 850 copies/s): 56 % before, 50 %
+after (46 % before stage G).
+---
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -323,6 +323,7 @@
+ #include "components/policy/core/common/features.h"
+ #include "components/policy/core/common/management/management_service.h"
+ #include "components/policy/core/common/policy_pref_names.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+ #include "components/prefs/pref_registry_simple.h"
+ #include "components/prefs/pref_service.h"
+@@ -689,6 +690,7 @@
+ #include "extensions/browser/extension_config_map_factory.h"
+ #include "extensions/browser/extension_mojo_binder_registry.h"
+ #include "extensions/browser/extensions_browser_client.h"
++#include "content/public/browser/guest_frame_pixels_policy.h"
+ #include "extensions/browser/extension_mojo_binder_registry_factory.h"
+ #include "extensions/browser/extension_protocols.h"
+ #include "extensions/browser/extension_registry.h"
+@@ -10113,10 +10115,37 @@
+   return false;
+ }
+ 
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++namespace {
++// Experiment: tells content when the screenshot policy that
++// MayReadGuestFramePixels() applies changes, so cached answers are dropped.
++class GuestFramePixelsPolicyWatcher : public base::SupportsUserData::Data {
++ public:
++  explicit GuestFramePixelsPolicyWatcher(PrefService* prefs) {
++    registrar_.Init(prefs);
++    registrar_.Add(
++        policy::policy_prefs::kDisableScreenshots,
++        base::BindRepeating(&content::NotifyGuestFramePixelsPolicyChanged));
++  }
++
++ private:
++  PrefChangeRegistrar registrar_;
++};
++const char kGuestFramePixelsPolicyWatcherKey = 0;
++}  // namespace
++#endif
++
+ bool ChromeContentBrowserClient::MayReadGuestFramePixels(
+     content::RenderFrameHost* embedder,
+     content::WebContents* guest_contents) {
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  Profile* profile =
++      Profile::FromBrowserContext(guest_contents->GetBrowserContext());
++  if (!profile->GetUserData(&kGuestFramePixelsPolicyWatcherKey)) {
++    profile->SetUserData(
++        &kGuestFramePixelsPolicyWatcherKey,
++        std::make_unique<GuestFramePixelsPolicyWatcher>(profile->GetPrefs()));
++  }
+   // Only a <controlledframe> guest, read by the frame that owns it, in a
+   // context that has the Controlled Frame capability, and not when
+   // screenshots are restricted (the same policy as captureVisibleRegion()).
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+--- a/content/browser/renderer_host/guest_frame_texture_host.cc
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -35,7 +35,9 @@
+ #include "content/browser/renderer_host/render_frame_proxy_host.h"
+ #include "content/browser/renderer_host/render_widget_host_view_child_frame.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
++#include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/document_user_data.h"
++#include "content/public/browser/guest_frame_pixels_policy.h"
+ #include "content/public/browser/page.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "content/public/browser/render_process_host.h"
+@@ -304,6 +306,7 @@
+       return;
+     }
+     site_ = std::move(site);
++    policy_valid_ = false;
+     ++generation_;
+     CancelPendingCopies();
+   }
+@@ -336,6 +339,32 @@
+   }
+ 
+  private:
++  // The ownership check for every copy: the structural part each time (cheap),
++  // the embedder's policy (MayReadGuestFramePixels()) cached until the guest
++  // WebContents changes, the guest navigates, or the embedder reports a
++  // policy change.
++  RenderWidgetHostViewChildFrame* FindView() {
++    if (!host_) {
++      return nullptr;
++    }
++    WebContentsImpl* guest = nullptr;
++    RenderWidgetHostViewChildFrame* view =
++        host_->FindOwnedGuestView(guest_frame_, &guest, /*check_policy=*/false);
++    if (!view) {
++      return nullptr;
++    }
++    const uint64_t generation =
++        GuestFrameTextureHost::GuestFramePixelsPolicyGeneration();
++    if (!policy_valid_ || policy_guest_.get() != guest ||
++        policy_generation_ != generation) {
++      policy_allowed_ = host_->MayReadPixels(guest);
++      policy_valid_ = true;
++      policy_guest_ = guest->GetWeakPtr();
++      policy_generation_ = generation;
++    }
++    return policy_allowed_ ? view : nullptr;
++  }
++
+   // Drops the browser's reference to a slot's image after `token` (the
+   // reader's release). If a copy into it is still pending, after that copy.
+   void ReleaseImage(size_t index, const gpu::SyncToken& token) {
+@@ -368,7 +397,7 @@
+     // Ownership is re-checked for every copy (the guest may have been
+     // detached, moved or destroyed since the source was created).
+     RenderWidgetHostViewChildFrame* view =
+-        host_ ? host_->FindOwnedGuestView(guest_frame_) : nullptr;
++        FindView();
+     const gfx::Size source_size =
+         view ? view->GetCompositorViewportPixelSize() : gfx::Size();
+     if (stopped_ || !view) {
+@@ -483,7 +512,7 @@
+     // elsewhere: a different embed token, see
+     // CompositorFrameSinkSupport::TakeCopyOutputRequests.)
+     RenderWidgetHostViewChildFrame* view =
+-        host_ ? host_->FindOwnedGuestView(guest_frame_) : nullptr;
++        FindView();
+     if (!view || view->GetFrameSinkId() != sink || generation != generation_) {
+       if (view && !stopped_) {
+         Issue(index, release_sync_token, std::move(callback), retries);
+@@ -518,7 +547,7 @@
+   void SetGuestInterval(base::TimeDelta requested) {
+     const base::TimeDelta interval = std::max(requested, cap_interval_);
+     RenderWidgetHostViewChildFrame* view =
+-        host_ ? host_->FindOwnedGuestView(guest_frame_) : nullptr;
++        FindView();
+     const viz::FrameSinkId sink =
+         view ? view->GetFrameSinkId() : viz::FrameSinkId();
+     if (throttled_sink_.is_valid() && throttled_sink_ != sink) {
+@@ -571,6 +600,11 @@
+   // Site of the guest's main page; a change cancels pending copies.
+   net::SchemefulSite site_;
+   uint64_t generation_ = 0;
++  // Cached MayReadGuestFramePixels() answer (see FindView()).
++  bool policy_valid_ = false;
++  bool policy_allowed_ = false;
++  base::WeakPtr<WebContents> policy_guest_;
++  uint64_t policy_generation_ = 0;
+   base::WeakPtrFactory<GuestFrameTextureSourceHostImpl> weak_factory_{this};
+ };
+ 
+@@ -594,9 +628,30 @@
+ 
+ RenderWidgetHostViewChildFrame* GuestFrameTextureHost::FindOwnedGuestView(
+     const blink::RemoteFrameToken& guest_frame,
+-    WebContentsImpl** guest_contents_out) {
++    WebContentsImpl** guest_contents_out,
++    bool check_policy) {
+   return FindOwnedGuestViewForFrame(&render_frame_host(), guest_frame,
+-                                    guest_contents_out);
++                                    guest_contents_out, check_policy);
++}
++
++bool GuestFrameTextureHost::MayReadPixels(WebContents* guest) {
++  return GetContentClient()->browser()->MayReadGuestFramePixels(
++      &render_frame_host(), guest);
++}
++
++namespace {
++uint64_t g_pixels_policy_generation = 0;
++}  // namespace
++
++// static
++uint64_t GuestFrameTextureHost::GuestFramePixelsPolicyGeneration() {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  return g_pixels_policy_generation;
++}
++
++void NotifyGuestFramePixelsPolicyChanged() {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  ++g_pixels_policy_generation;
+ }
+ 
+ // static
+@@ -618,7 +673,8 @@
+ GuestFrameTextureHost::FindOwnedGuestViewForFrame(
+     RenderFrameHost* caller,
+     const blink::RemoteFrameToken& guest_frame,
+-    WebContentsImpl** guest_contents_out) {
++    WebContentsImpl** guest_contents_out,
++    bool check_policy) {
+   auto* rfh = static_cast<RenderFrameHostImpl*>(caller);
+   RenderFrameProxyHost* proxy = RenderFrameProxyHost::FromFrameToken(
+       rfh->GetProcess()->GetDeprecatedID(), guest_frame);
+@@ -646,8 +702,8 @@
+   // The embedder (Chrome) restricts this to <controlledframe> guests of
+   // frames with the Controlled Frame capability and applies the screenshot
+   // policy; checked for every copy, so a policy change stops the next one.
+-  if (!GetContentClient()->browser()->MayReadGuestFramePixels(
+-          caller, guest_contents)) {
++  if (check_policy && !GetContentClient()->browser()->MayReadGuestFramePixels(
++                          caller, guest_contents)) {
+     return nullptr;
+   }
+   auto* view = inner_root->current_frame_host()->GetView();
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.h b/content/browser/renderer_host/guest_frame_texture_host.h
+--- a/content/browser/renderer_host/guest_frame_texture_host.h
++++ b/content/browser/renderer_host/guest_frame_texture_host.h
+@@ -17,6 +17,7 @@
+ 
+ class RenderFrameHost;
+ class RenderWidgetHostViewChildFrame;
++class WebContents;
+ class WebContentsImpl;
+ 
+ // Experiment. Lets a document get its guests' pixels (an inner
+@@ -50,15 +51,27 @@
+   // Returns the guest's view if `guest_frame` is the proxy of an inner
+   // (guest) WebContents' main frame whose outer delegate frame is a child of
+   // this document's frame; nullptr otherwise.
++  // With `check_policy` false only the structural part of the check is done;
++  // the caller then asks ContentBrowserClient::MayReadGuestFramePixels()
++  // itself (sources cache that answer, see GuestFramePixelsPolicyGeneration()).
+   RenderWidgetHostViewChildFrame* FindOwnedGuestView(
+       const blink::RemoteFrameToken& guest_frame,
+-      WebContentsImpl** guest_contents_out = nullptr);
++      WebContentsImpl** guest_contents_out = nullptr,
++      bool check_policy = true);
+ 
+   // The ownership check used for every request, for a given calling frame.
+   static RenderWidgetHostViewChildFrame* FindOwnedGuestViewForFrame(
+       RenderFrameHost* caller,
+       const blink::RemoteFrameToken& guest_frame,
+-      WebContentsImpl** guest_contents_out = nullptr);
++      WebContentsImpl** guest_contents_out = nullptr,
++      bool check_policy = true);
++
++  // The embedder's policy (ContentBrowserClient::MayReadGuestFramePixels())
++  // for this document reading `guest`.
++  bool MayReadPixels(WebContents* guest);
++
++  // Incremented by NotifyGuestFramePixelsPolicyChanged().
++  static uint64_t GuestFramePixelsPolicyGeneration();
+ 
+   // Test-only: whether `caller` passes the ownership check for the guest
+   // whose main frame is `guest_main_frame`, using the token of the guest's
+diff --git a/content/public/browser/BUILD.gn b/content/public/browser/BUILD.gn
+--- a/content/public/browser/BUILD.gn
++++ b/content/public/browser/BUILD.gn
+@@ -197,6 +197,7 @@
+     "frame_eviction_opt_out_client.cc",
+     "frame_eviction_opt_out_client.h",
+     "frame_rate_throttling.h",
++    "guest_frame_pixels_policy.h",
+     "frame_tree_node_id.h",
+     "frame_type.h",
+     "fullscreen_types.h",
+diff --git a/content/public/browser/guest_frame_pixels_policy.h b/content/public/browser/guest_frame_pixels_policy.h
+new file mode 100644
+--- /dev/null
++++ b/content/public/browser/guest_frame_pixels_policy.h
+@@ -0,0 +1,20 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_PUBLIC_BROWSER_GUEST_FRAME_PIXELS_POLICY_H_
++#define CONTENT_PUBLIC_BROWSER_GUEST_FRAME_PIXELS_POLICY_H_
++
++#include "content/common/content_export.h"
++
++namespace content {
++
++// Experiment: the embedder calls this when anything that
++// ContentBrowserClient::MayReadGuestFramePixels() depends on may have changed
++// (e.g. a screenshot policy). Readers cache that answer per source and ask
++// again before their next copy.
++CONTENT_EXPORT void NotifyGuestFramePixelsPolicyChanged();
++
++}  // namespace content
++
++#endif  // CONTENT_PUBLIC_BROWSER_GUEST_FRAME_PIXELS_POLICY_H_

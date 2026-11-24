@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 21:06:57 +0000
+Subject: [PATCH 41/50] Experiment: quantize the compositing scale sent to a remote frame (kQuantizeRemoteFrameCompositingScale)
+
+RemoteFrameView::UpdateCompositingScaleFactor() sends the child frame the
+scale at which it is shown (frame-to-local-root transform scale x the
+widget's compositing scale, clamped to 0.25-5). Under a transform that
+changes every frame (a zooming card, a card rotating with perspective) the
+value differs on every frame; each change generates a new LocalSurfaceId
+(RemoteFrame::SynchronizeVisualProperties) and the child re-rasters at the
+new scale.
+
+With kQuantizeRemoteFrameCompositingScale (disabled by default): the scale
+is rounded up to a step of 2^(1/4) (about 19%; never below the scale
+shown); a lower step is taken only when the raw scale is a full sqrt(2)
+below the current step and has not changed for 300 ms (a delayed re-check
+on the parent local root's kInternalDefault task runner applies it once the
+transform has settled); a higher step is taken at once.
+---
+diff --git a/third_party/blink/renderer/core/frame/remote_frame_view.cc b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+--- a/third_party/blink/renderer/core/frame/remote_frame_view.cc
++++ b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+@@ -6,6 +6,8 @@
+ 
+ #include <algorithm>
+ 
++#include <cmath>
++
+ #include "base/feature_list.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/trace_event/trace_event.h"
+@@ -13,6 +15,7 @@
+ #include "printing/buildflags/buildflags.h"
+ #include "third_party/blink/public/common/frame/frame_owner_element_type.h"
+ #include "third_party/blink/public/common/page/page_zoom.h"
++#include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/public/mojom/use_counter/metrics/web_feature.mojom-blink.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+@@ -25,6 +28,8 @@
+ #include "third_party/blink/renderer/core/page/page.h"
+ #include "third_party/blink/renderer/core/paint/paint_info.h"
+ #include "third_party/blink/renderer/platform/graphics/graphics_context.h"
++#include "third_party/blink/renderer/platform/heap/persistent.h"
++#include "third_party/blink/renderer/platform/wtf/functional.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/cull_rect.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/drawing_recorder.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/foreign_layer_display_item.h"
+@@ -40,5 +45,12 @@
+ 
+ namespace blink {
++
++namespace {
++// Experiment: see RemoteFrameView::UpdateCompositingScaleFactor().
++BASE_FEATURE(kQuantizeRemoteFrameCompositingScale,
++             base::FEATURE_DISABLED_BY_DEFAULT);
++}  // namespace
++
+ 
+ BASE_FEATURE(kSkipUnnecessaryRemoteFrameGeometryPropagation,
+              base::FEATURE_ENABLED_BY_DEFAULT);
+@@ -296,5 +308,52 @@
+       std::clamp(compositing_scale_factor_, kMinCompositingScaleFactor,
+                  kMaxCompositingScaleFactor);
++
++  // Experiment: a card under a changing transform (zoom) gets a new
++  // scale on every frame, and the child re-rasters for each. Quantize to
++  // steps of 2^(1/4): round up (never below the scale shown), go down only
++  // when the scale is a full sqrt(2) below the current step and has not
++  // changed for kSettle (re-checked then).
++  if (base::FeatureList::IsEnabled(kQuantizeRemoteFrameCompositingScale)) {
++    const float raw = compositing_scale_factor_;
++    const base::TimeTicks now = base::TimeTicks::Now();
++    if (raw != raw_compositing_scale_factor_) {
++      raw_compositing_scale_factor_ = raw;
++      raw_scale_changed_at_ = now;
++    }
++    const float step = std::clamp(
++        std::exp2(std::ceil(std::log2(raw) * 4.0f - 1e-3f) / 4.0f),
++        kMinCompositingScaleFactor, kMaxCompositingScaleFactor);
++    constexpr base::TimeDelta kSettle = base::Milliseconds(300);
++    float quantized = step;
++    if (step < previous_scale_factor) {
++      const bool far_below =
++          raw <= previous_scale_factor / std::sqrt(2.0f) + 1e-4f;
++      const bool settled = now - raw_scale_changed_at_ >= kSettle;
++      if (!far_below) {
++        quantized = previous_scale_factor;
++      } else if (!settled) {
++        quantized = previous_scale_factor;
++        if (!scale_recheck_pending_) {
++          scale_recheck_pending_ = true;
++          local_root_view->GetFrame()
++              .GetTaskRunner(TaskType::kInternalDefault)
++              ->PostDelayedTask(
++                  FROM_HERE,
++                  BindOnce(
++                      [](RemoteFrameView* view) {
++                        if (!view) {
++                          return;
++                        }
++                        view->scale_recheck_pending_ = false;
++                        view->UpdateCompositingScaleFactor();
++                      },
++                      WrapWeakPersistent(this)),
++                  kSettle);
++        }
++      }
++    }
++    compositing_scale_factor_ = quantized;
++  }
+ 
+   if (compositing_scale_factor_ != previous_scale_factor)
+     remote_frame_->SynchronizeVisualProperties();
+diff --git a/third_party/blink/renderer/core/frame/remote_frame_view.h b/third_party/blink/renderer/core/frame/remote_frame_view.h
+--- a/third_party/blink/renderer/core/frame/remote_frame_view.h
++++ b/third_party/blink/renderer/core/frame/remote_frame_view.h
+@@ -123,6 +123,12 @@
+   mojom::blink::ViewportIntersectionState last_intersection_state_;
+   gfx::Rect compositing_rect_;
+   float compositing_scale_factor_ = 1.0f;
++  // Experiment (kQuantizeRemoteFrameCompositingScale): the unquantized
++  // scale and when it last changed; a lower step is applied only once it has
++  // been stable for a while (a deferred re-check is pending meanwhile).
++  float raw_compositing_scale_factor_ = 0.0f;
++  base::TimeTicks raw_scale_changed_at_;
++  bool scale_recheck_pending_ = false;
+ 
+   std::optional<NaturalSizingInfo> natural_sizing_info_;
+   bool needs_occlusion_tracking_ = false;

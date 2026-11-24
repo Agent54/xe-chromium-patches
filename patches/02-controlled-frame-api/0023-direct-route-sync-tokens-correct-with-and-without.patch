@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 19:24:19 +0000
+Subject: [PATCH 23/50] direct route: sync tokens correct with and without automatic token management
+
+Viz: SkiaOutputSurfaceImpl took a blit destination's tokens only from
+ClientSharedImage::GetSyncTokensForDisplayCompositor(), which with
+UseAutomaticSyncTokenManagement ignores the explicit token (it returns the
+tokens tracked on the deserialized image) - so the copy would not wait for
+the previous reader in another process. The explicit token is now added in
+both modes.
+
+Blink: before asking for a copy into a slot, the source passes one token
+that covers every reader: the last release token, or with automatic
+management all tokens tracked on the image (waited on with the renderer's
+SharedImageInterface, then one verified token). When a copy arrives its
+ready token is recorded on the image (EndDisplayCompositorAccess(), a no-op
+without automatic management) so VideoFrame readers that take tokens from
+the image wait for the copy. The VideoFrame release callback now sets the
+image's destruction sync token to the reader's release token, so an image
+whose source is gone while the frame is held is destroyed after the final
+reader.
+
+Tests: ControlledFrameTextureSourceTest.* pass with and without
+--enable-features=UseAutomaticSyncTokenManagement.
+---
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+@@ -1038,6 +1038,15 @@
+     std::vector<gpu::SyncToken> sync_tokens =
+         blit_request.shared_image()->GetSyncTokensForDisplayCompositor(
+             blit_request.sync_token());
++    // Experiment: with automatic sync token management the call above
++    // returns only the tokens tracked on this (deserialized) image, not the
++    // caller's explicit token (for the direct route: the previous reader's
++    // release, from another process). Wait on it in both modes.
++    if (blit_request.sync_token().HasData() &&
++        std::ranges::find(sync_tokens, blit_request.sync_token()) ==
++            sync_tokens.end()) {
++      sync_tokens.push_back(blit_request.sync_token());
++    }
+     resource_sync_tokens_.insert(resource_sync_tokens_.end(),
+                                  sync_tokens.begin(), sync_tokens.end());
+   }
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+@@ -275,10 +275,35 @@
+     it->state = SlotState::kCopying;
+     it->issued = now;
+     source_->CopyNextFrame(
+-        index, it->release_token,
++        index, ReleaseTokenForCopy(*it),
+         blink::BindOnce(&GuestFrameTextureSource::OnCopied,
+                         WrapWeakPersistent(this), index, ring_generation_));
+   }
++}
++
++gpu::SyncToken GuestFrameTextureSource::ReleaseTokenForCopy(Slot& slot) {
++  // Without automatic sync token management this is the last reader's
++  // release token. With it, readers record their accesses on the image
++  // instead; wait for all of them on this renderer's shared image interface
++  // and pass one token after those waits.
++  std::vector<gpu::SyncToken> tokens =
++      slot.shared_image->GetSyncTokensForDisplayCompositor(slot.release_token);
++  if (tokens.empty()) {
++    return gpu::SyncToken();
++  }
++  if (tokens.size() == 1) {
++    return tokens[0];
++  }
++  auto wrapper = SharedGpuContext::ContextProviderWrapper();
++  gpu::SharedImageInterface* sii =
++      wrapper ? wrapper->ContextProvider().SharedImageInterface() : nullptr;
++  if (!sii) {
++    return slot.release_token;
++  }
++  for (const gpu::SyncToken& token : tokens) {
++    sii->WaitSyncToken(token);
++  }
++  return sii->GenVerifiedSyncToken();
+ }
+ 
+ void GuestFrameTextureSource::OnCopied(
+@@ -317,6 +342,9 @@
+                          : (copy_round_trip_ * 7 + rtt) / 8;
+   slot.state = SlotState::kReady;
+   slot.ready_token = ready_token;
++  // With automatic sync token management, readers of the VideoFrame take
++  // their tokens from the image; record the copy there (no-op otherwise).
++  slot.shared_image->EndDisplayCompositorAccess(ready_token);
+   slot.sequence = next_sequence_++;
+   MaybeResolveRead();
+   Pump();
+@@ -357,8 +385,13 @@
+   auto release_cb = ConvertToBaseOnceCallback(CrossThreadBindOnce(
+       [](scoped_refptr<base::SingleThreadTaskRunner> task_runner,
+          CrossThreadWeakHandle<GuestFrameTextureSource> source,
+-         wtf_size_t index, uint32_t generation,
+-         const gpu::SyncToken& release_token) {
++         scoped_refptr<gpu::ClientSharedImage> image, wtf_size_t index,
++         uint32_t generation, const gpu::SyncToken& release_token) {
++        // If the source is gone by the time the frame is released, the image
++        // is destroyed with the last reference: after the final reader.
++        if (release_token.HasData()) {
++          image->UpdateDestructionSyncToken(release_token);
++        }
+         PostCrossThreadTask(
+             *task_runner, FROM_HERE,
+             CrossThreadBindOnce(
+@@ -366,8 +399,8 @@
+                 MakeUnwrappingCrossThreadWeakHandle(std::move(source)), index,
+                 generation, release_token));
+       },
+-      std::move(task_runner), MakeCrossThreadWeakHandle(this), index,
+-      ring_generation_));
++      std::move(task_runner), MakeCrossThreadWeakHandle(this),
++      newest->shared_image, index, ring_generation_));
+   auto media_frame = media::VideoFrame::WrapSharedImage(
+       media::PIXEL_FORMAT_ABGR, newest->shared_image, newest->ready_token,
+       std::move(release_cb), gfx::Rect(width_, height_),
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+@@ -86,6 +86,8 @@
+   void OnSourceCreated(Vector<gpu::ExportedSharedImage> images,
+                        const gpu::SyncToken& creation_token);
+   void Pump();
++  // The token the next copy into `slot` must wait on (see .cc).
++  gpu::SyncToken ReleaseTokenForCopy(Slot& slot);
+   void ImportImages(Vector<gpu::ExportedSharedImage> images,
+                     const gpu::SyncToken& creation_token);
+   void OnCopied(wtf_size_t index,

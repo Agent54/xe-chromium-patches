@@ -1,0 +1,608 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 19:18:14 +0000
+Subject: [PATCH 20/50] direct route: close() and end of stream release everything at once
+
+Blink: close() and end of stream (now the same) resolve a pending read with
+null, make every later read() resolve null (no ready frame is handed out
+after close), drop the renderer's references to every slot image not held
+by a VideoFrame and stop the browser side. Frames still held stay valid
+until they are closed; each then releases its slot, and the pipe closes
+after the last one.
+
+Browser: new GuestFrameTextureSourceHost.Stop(held, release tokens) and
+ReleaseSlot(index, token). Stop cancels the source's copies in viz, ends the
+keep-alive (capturer count) and the source's frame-rate requests, and drops
+the images of slots not held (after the reader's release token; after the
+pending copy if one is in flight). The images count against the quota until
+dropped.
+
+Viz: new FrameSinkManager.CancelKeyedCopyOutputRequests(frame_sink_id, key):
+the sink drops queued and parked requests with that key (they complete with
+an empty result) and forgets the key's damage count. The browser calls it on
+Stop and when a source goes away.
+
+Also fixes a lifetime bug the new test exposed: GuestFrameTextureSource is
+now an ActiveScriptWrappable that stays alive while a read() is pending (it
+could be collected with the read's resolver unresolved, a DCHECK), and it
+closes when its context is destroyed.
+
+Test: ControlledFrameTextureSourceTest.Quota also checks that read() after
+close() is null, that a frame held across close() still has the guest's
+pixels, and that after closing, the document can allocate the same amount
+again.
+---
+diff --git a/chrome/browser/controlled_frame/controlled_frame_apitest.cc b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+--- a/chrome/browser/controlled_frame/controlled_frame_apitest.cc
++++ b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+@@ -1105,6 +1105,41 @@
+       }
+       return 'never refused';
+     })();)"));
++
++  // close() gives the memory back at once, except for frames still held,
++  // which stay valid until they are closed; read() after close() is null.
++  EXPECT_EQ("released", content::EvalJs(app_frame, R"(
++    (async () => {
++      const held = await sources[0].read();
++      for (const s of sources) s.close();
++      if ((await sources[1].read()) !== null) return 'frame after close';
++      const c = new OffscreenCanvas(4, 4);
++      const ctx = c.getContext('2d');
++      ctx.drawImage(held, 0, 0, 4, 4);
++      const d = ctx.getImageData(2, 2, 1, 1).data;
++      if (!(d[0] < 60 && d[1] > 180 && d[2] < 60)) return 'held frame ' + d;
++      held.close();
++      const f = document.querySelector('controlledframe');
++      for (let i = 0; i < 8; i++) {
++        let ok = false;
++        // Stop() and the next CreateSource() travel on different pipes.
++        for (let t = 0; t < 20 && !ok; t++) {
++          const s = await f.createTextureSource(
++              {width: 1920, height: 1080, poolSize: 16});
++          const vf = await s.read();
++          if (vf) {
++            vf.close();
++            sources[i] = s;
++            ok = true;
++          } else {
++            await new Promise(r => setTimeout(r, 100));
++          }
++        }
++        if (!ok) return 'not released at ' + i;
++      }
++      for (const s of sources) s.close();
++      return 'released';
++    })();)"));
+ }
+ 
+ // A pending read resolves with null when the guest is destroyed or its
+diff --git a/components/viz/host/host_frame_sink_manager.cc b/components/viz/host/host_frame_sink_manager.cc
+--- a/components/viz/host/host_frame_sink_manager.cc
++++ b/components/viz/host/host_frame_sink_manager.cc
+@@ -481,6 +481,13 @@
+   frame_sink_manager_->SetFrameSinkThrottleInterval(frame_sink_id, interval);
+ }
+ 
++void HostFrameSinkManager::CancelKeyedCopyOutputRequests(
++    const FrameSinkId& frame_sink_id,
++    const base::UnguessableToken& wait_for_new_frame_key) {
++  frame_sink_manager_->CancelKeyedCopyOutputRequests(frame_sink_id,
++                                                     wait_for_new_frame_key);
++}
++
+ void HostFrameSinkManager::Throttle(const std::vector<FrameSinkId>& ids,
+                                     base::TimeDelta interval) {
+   frame_sink_manager_->Throttle(ids, interval);
+diff --git a/components/viz/host/host_frame_sink_manager.h b/components/viz/host/host_frame_sink_manager.h
+--- a/components/viz/host/host_frame_sink_manager.h
++++ b/components/viz/host/host_frame_sink_manager.h
+@@ -331,6 +331,9 @@
+   // Experiment, see mojom::FrameSinkManager.
+   void SetFrameSinkThrottleInterval(const FrameSinkId& frame_sink_id,
+                                     base::TimeDelta interval);
++  void CancelKeyedCopyOutputRequests(
++      const FrameSinkId& frame_sink_id,
++      const base::UnguessableToken& wait_for_new_frame_key);
+ 
+   // HitTestDataProvider implementation.
+   void AddHitTestRegionObserver(HitTestRegionObserver* observer) override;
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+@@ -1881,6 +1881,17 @@
+   last_copied_damage_by_key_.clear();
+ }
+ 
++void CompositorFrameSinkSupport::CancelKeyedCopyOutputRequests(
++    const base::UnguessableToken& key) {
++  auto has_key = [&key](const std::unique_ptr<PendingCopyOutputRequest>& r) {
++    const auto& k = r->copy_output_request->wait_for_new_frame_key();
++    return k && *k == key;
++  };
++  std::erase_if(deferred_copy_output_requests_, has_key);
++  std::erase_if(copy_output_requests_, has_key);
++  last_copied_damage_by_key_.erase(key);
++}
++
+ void CompositorFrameSinkSupport::SetLayerContextWantsBeginFrames(
+     bool wants_begin_frames) {
+   layer_context_wants_begin_frames_ = wants_begin_frames;
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.h b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.h
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+@@ -288,6 +288,10 @@
+   // will be transferred to the corresponding `Surface`s
+   void ClearAllPendingCopyOutputRequests();
+ 
++  // Experiment: drops queued and parked copy requests that carry
++  // `key` (they complete with an empty result) and forgets the key.
++  void CancelKeyedCopyOutputRequests(const base::UnguessableToken& key);
++
+   const RegionCaptureBounds& current_capture_bounds() const {
+     return current_capture_bounds_;
+   }
+diff --git a/components/viz/service/frame_sinks/frame_sink_manager_impl.cc b/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
+--- a/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
++++ b/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
+@@ -1350,6 +1350,14 @@
+   UpdateThrottling();
+ }
+ 
++void FrameSinkManagerImpl::CancelKeyedCopyOutputRequests(
++    const FrameSinkId& frame_sink_id,
++    const base::UnguessableToken& wait_for_new_frame_key) {
++  if (auto* support = GetFrameSinkForId(frame_sink_id)) {
++    support->CancelKeyedCopyOutputRequests(wait_for_new_frame_key);
++  }
++}
++
+ void FrameSinkManagerImpl::StopThrottlingAllFrameSinks() {
+   global_throttle_interval_ = std::nullopt;
+   UpdateThrottling();
+diff --git a/components/viz/service/frame_sinks/frame_sink_manager_impl.h b/components/viz/service/frame_sinks/frame_sink_manager_impl.h
+--- a/components/viz/service/frame_sinks/frame_sink_manager_impl.h
++++ b/components/viz/service/frame_sinks/frame_sink_manager_impl.h
+@@ -213,6 +213,9 @@
+   void StopThrottlingAllFrameSinks() override;
+   void SetFrameSinkThrottleInterval(const FrameSinkId& frame_sink_id,
+                                     base::TimeDelta interval) override;
++  void CancelKeyedCopyOutputRequests(
++      const FrameSinkId& frame_sink_id,
++      const base::UnguessableToken& wait_for_new_frame_key) override;
+   void ClearUnclaimedViewTransitionResources(
+       const blink::ViewTransitionToken& transition_token) override;
+   void CreateMetricsRecorderForTest(
+diff --git a/components/viz/test/test_frame_sink_manager.h b/components/viz/test/test_frame_sink_manager.h
+--- a/components/viz/test/test_frame_sink_manager.h
++++ b/components/viz/test/test_frame_sink_manager.h
+@@ -96,6 +96,9 @@
+   void StopThrottlingAllFrameSinks() override {}
+   void SetFrameSinkThrottleInterval(const FrameSinkId& frame_sink_id,
+                                     base::TimeDelta interval) override {}
++  void CancelKeyedCopyOutputRequests(
++      const FrameSinkId& frame_sink_id,
++      const base::UnguessableToken& wait_for_new_frame_key) override {}
+   void ClearUnclaimedViewTransitionResources(
+       const blink::ViewTransitionToken& transition_token) override {}
+   void CreateMetricsRecorderForTest(
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+--- a/content/browser/renderer_host/guest_frame_texture_host.cc
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -8,9 +8,11 @@
+ #include <map>
+ #include <tuple>
+ #include <memory>
++#include <optional>
+ #include <utility>
+ #include <vector>
+ 
++#include "base/containers/flat_set.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/memory/ref_counted.h"
+@@ -187,7 +189,8 @@
+                           ? base::Seconds(1.0 / max_frame_rate)
+                           : base::TimeDelta()),
+         account_(std::move(account)),
+-        in_flight_(images_.size(), false) {
++        in_flight_(images_.size(), false),
++        release_after_copy_(images_.size()) {
+     SetGuestInterval(base::TimeDelta());
+     if (backpressure_ || cap_interval_.is_positive()) {
+       // Also re-applies the cap if the guest's frame sink changes.
+@@ -199,6 +202,7 @@
+   }
+ 
+   ~GuestFrameTextureSourceHostImpl() override {
++    CancelPendingCopies();
+     cap_interval_ = base::TimeDelta();
+     SetGuestInterval(base::TimeDelta());
+     // The renderer holds its own imported references; ours go away here.
+@@ -221,8 +225,8 @@
+                      CopyNextFrameCallback callback) override {
+     // One copy per slot at a time, and a bound on copies in flight per
+     // document and process.
+-    if (index >= images_.size() || in_flight_[index] ||
+-        !account_->TryBeginRequest()) {
++    if (stopped_ || index >= images_.size() || !images_[index] ||
++        in_flight_[index] || !account_->TryBeginRequest()) {
+       std::move(callback).Run(false, gpu::SyncToken());
+       return;
+     }
+@@ -231,7 +235,59 @@
+     Issue(index, release_sync_token, std::move(callback), /*retries=*/2);
+   }
+ 
++  void Stop(const std::vector<bool>& held,
++            const std::vector<gpu::SyncToken>& release_sync_tokens) override {
++    if (stopped_ || held.size() != images_.size() ||
++        release_sync_tokens.size() != images_.size()) {
++      return;
++    }
++    stopped_ = true;
++    CancelPendingCopies();
++    backpressure_timer_.Stop();
++    backpressure_ = false;
++    cap_interval_ = base::TimeDelta();
++    SetGuestInterval(base::TimeDelta());
++    capture_handle_.RunAndReset();
++    for (size_t i = 0; i < images_.size(); ++i) {
++      if (!held[i]) {
++        ReleaseImage(i, release_sync_tokens[i]);
++      }
++    }
++  }
++
++  void ReleaseSlot(uint32_t index,
++                   const gpu::SyncToken& release_sync_token) override {
++    if (stopped_ && index < images_.size()) {
++      ReleaseImage(index, release_sync_token);
++    }
++  }
++
+  private:
++  // Drops the browser's reference to a slot's image after `token` (the
++  // reader's release). If a copy into it is still pending, after that copy.
++  void ReleaseImage(size_t index, const gpu::SyncToken& token) {
++    if (!images_[index]) {
++      return;
++    }
++    if (in_flight_[index]) {
++      release_after_copy_[index] = token;
++      return;
++    }
++    images_[index]->UpdateDestructionSyncToken(token);
++    images_[index] = nullptr;
++    account_->RemoveBytes(ImageBytes(size_));
++  }
++
++  // Copies requested from viz and not yet taken for drawing are dropped (they
++  // complete with an empty result), and viz forgets this source's key.
++  void CancelPendingCopies() {
++    for (const viz::FrameSinkId& sink : requested_sinks_) {
++      GetHostFrameSinkManager()->CancelKeyedCopyOutputRequests(sink,
++                                                               wait_key_);
++    }
++    requested_sinks_.clear();
++  }
++
+   void Issue(uint32_t index,
+              const gpu::SyncToken& release_sync_token,
+              CopyNextFrameCallback callback,
+@@ -242,7 +298,8 @@
+         host_ ? host_->FindOwnedGuestView(guest_frame_) : nullptr;
+     const gfx::Size source_size =
+         view ? view->GetCompositorViewportPixelSize() : gfx::Size();
+-    if (!view || !view->IsSurfaceAvailableForCopy() || source_size.IsEmpty()) {
++    if (stopped_ || !view || !view->IsSurfaceAvailableForCopy() ||
++        source_size.IsEmpty()) {
+       Reply(index, std::move(callback), false, gpu::SyncToken());
+       return;
+     }
+@@ -264,6 +321,7 @@
+         images_[index], release_sync_token,
+         /*populates_mappable_shared_image=*/false));
+     request->set_wait_for_new_frame_key(wait_key_);
++    requested_sinks_.insert(view->GetFrameSinkId());
+     GetHostFrameSinkManager()->RequestCopyOfOutput(
+         view->GetCurrentSurfaceId(), std::move(request),
+         /*capture_exact_surface_id=*/false, base::TimeDelta());
+@@ -278,6 +336,14 @@
+       in_flight_[index] = false;
+       account_->EndRequests(1);
+     }
++    if (release_after_copy_[index]) {
++      // Stopped while this copy was pending: the image goes after the copy.
++      const gpu::SyncToken release =
++          success ? token : *release_after_copy_[index];
++      release_after_copy_[index].reset();
++      ReleaseImage(index, release);
++      success = false;
++    }
+     std::move(callback).Run(success, token);
+   }
+ 
+@@ -289,7 +355,7 @@
+     if (result->IsEmpty()) {
+       // The guest's frame sink went away (e.g. cross-process navigation of
+       // the guest): retry on the current one, if the guest still exists.
+-      if (retries > 0) {
++      if (retries > 0 && !stopped_) {
+         Issue(index, release_sync_token, std::move(callback), retries - 1);
+         return;
+       }
+@@ -353,11 +419,17 @@
+   scoped_refptr<viz::RasterContextProvider> context_provider_;
+   std::vector<scoped_refptr<gpu::ClientSharedImage>> images_;
+   base::ScopedClosureRunner capture_handle_;
+-  const bool backpressure_ = false;
++  bool backpressure_ = false;
+   base::TimeDelta cap_interval_;
+   const scoped_refptr<UsageAccount> account_;
+   // Slots with a copy requested and not replied to.
+   std::vector<bool> in_flight_;
++  // Release tokens for slots given up by Stop()/ReleaseSlot() while a copy
++  // into them was pending.
++  std::vector<std::optional<gpu::SyncToken>> release_after_copy_;
++  // Frame sinks this source has sent copy requests to.
++  base::flat_set<viz::FrameSinkId> requested_sinks_;
++  bool stopped_ = false;
+   base::WeakPtrFactory<GuestFrameTextureSourceHostImpl> weak_factory_{this};
+ };
+ 
+diff --git a/services/viz/privileged/mojom/compositing/frame_sink_manager.mojom b/services/viz/privileged/mojom/compositing/frame_sink_manager.mojom
+--- a/services/viz/privileged/mojom/compositing/frame_sink_manager.mojom
++++ b/services/viz/privileged/mojom/compositing/frame_sink_manager.mojom
+@@ -213,6 +213,13 @@
+   SetFrameSinkThrottleInterval(FrameSinkId frame_sink_id,
+                                mojo_base.mojom.TimeDelta interval);
+ 
++  // Experiment: drops the copy requests of `frame_sink_id` that carry
++  // `wait_for_new_frame_key` and are not yet taken for drawing (parked or
++  // queued; they complete with an empty result) and forgets the key.
++  CancelKeyedCopyOutputRequests(
++      FrameSinkId frame_sink_id,
++      mojo_base.mojom.UnguessableToken wait_for_new_frame_key);
++
+   // Throttles all current and future frame sinks to send BeginFrames at an
+   // interval at least as long as |interval|. Because there is a single viz
+   // process, which itself contains a single host frame sink manager, calling
+diff --git a/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom b/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
+--- a/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
++++ b/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
+@@ -43,4 +43,13 @@
+   // `success` = false if the guest went away or is no longer owned.
+   CopyNextFrame(uint32 index, gpu.mojom.SyncToken release_sync_token)
+       => (bool success, gpu.mojom.SyncToken ready_sync_token);
++
++  // Stops the source (close() or end of stream): copies not yet drawn are
++  // cancelled (they reply `success` = false), the guest is no longer kept
++  // rendering or throttled for this source, and the images of the slots the
++  // caller no longer holds (`held[i]` false) are released after
++  // `release_sync_tokens[i]`. The caller releases the held ones with
++  // ReleaseSlot() as their frames are closed, then closes the pipe.
++  Stop(array<bool> held, array<gpu.mojom.SyncToken> release_sync_tokens);
++  ReleaseSlot(uint32 index, gpu.mojom.SyncToken release_sync_token);
+ };
+diff --git a/third_party/blink/renderer/bindings/core/v8/active_script_wrappable_creation_key.h b/third_party/blink/renderer/bindings/core/v8/active_script_wrappable_creation_key.h
+--- a/third_party/blink/renderer/bindings/core/v8/active_script_wrappable_creation_key.h
++++ b/third_party/blink/renderer/bindings/core/v8/active_script_wrappable_creation_key.h
+@@ -47,6 +47,7 @@
+   template <typename NativeFrameType>
+   friend class FrameQueueUnderlyingSource;
+   friend class Geolocation;
++  friend class GuestFrameTextureSource;  // Experiment.
+   friend class HIDDevice;
+   friend class HTMLImageElement;
+   friend class HTMLInputElement;
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+@@ -69,7 +69,9 @@
+     ExecutionContext* context,
+     const RemoteFrameToken& token,
+     const GuestFrameTextureSourceInit* init)
+-    : execution_context_(context),
++    : ActiveScriptWrappable<GuestFrameTextureSource>({}),
++      ExecutionContextLifecycleObserver(context),
++      execution_context_(context),
+       host_(context),
+       source_(context),
+       token_(token),
+@@ -102,6 +104,19 @@
+   visitor->Trace(source_);
+   visitor->Trace(pending_read_);
+   ScriptWrappable::Trace(visitor);
++  ExecutionContextLifecycleObserver::Trace(visitor);
++}
++
++bool GuestFrameTextureSource::HasPendingActivity() const {
++  return pending_read_ != nullptr;
++}
++
++void GuestFrameTextureSource::ContextDestroyed() {
++  if (pending_read_) {
++    pending_read_->Detach();
++    pending_read_ = nullptr;
++  }
++  close();
+ }
+ 
+ wtf_size_t GuestFrameTextureSource::CountIn(SlotState state) const {
+@@ -148,6 +163,10 @@
+       MakeGarbageCollected<ScriptPromiseResolver<IDLNullable<VideoFrame>>>(
+           script_state, exception_state.GetContext());
+   auto promise = resolver->Promise();
++  if (closed_) {
++    resolver->Resolve(nullptr);
++    return promise;
++  }
+   pending_read_ = resolver;
+   MaybeResolveRead();
+   Pump();
+@@ -216,6 +235,9 @@
+ void GuestFrameTextureSource::OnCopied(wtf_size_t index,
+                                        bool success,
+                                        const gpu::SyncToken& ready_token) {
++  if (closed_ || index >= slots_.size()) {
++    return;
++  }
+   Slot& slot = slots_[index];
+   if (!success) {
+     // The guest is gone or no longer owned by this document.
+@@ -306,23 +328,77 @@
+     return;
+   }
+   Slot& slot = slots_[index];
++  const gpu::SyncToken token =
++      release_token.HasData() ? release_token : slot.ready_token;
++  if (closed_) {
++    // The source was closed while this frame was held: its image goes now.
++    if (slot.state != SlotState::kHeld) {
++      return;
++    }
++    slot.state = SlotState::kReleased;
++    if (slot.shared_image) {
++      slot.shared_image->UpdateDestructionSyncToken(token);
++      slot.shared_image = nullptr;
++    }
++    if (source_.is_bound()) {
++      source_->ReleaseSlot(index, token);
++      if (!CountIn(SlotState::kHeld)) {
++        source_.reset();
++      }
++    }
++    return;
++  }
+   slot.state = SlotState::kFree;
+-  slot.release_token =
+-      release_token.HasData() ? release_token : slot.ready_token;
++  slot.release_token = token;
+   Pump();
+ }
+ 
+ void GuestFrameTextureSource::End() {
+-  ended_ = true;
+-  MaybeResolveRead();
++  // End of stream (the guest is gone or no longer readable): same as close().
++  close();
+ }
+ 
+ void GuestFrameTextureSource::close() {
++  if (closed_) {
++    return;
++  }
++  closed_ = true;
+   ended_ = true;
+-  source_.reset();
+   if (pending_read_) {
+     pending_read_->Resolve(nullptr);
+     pending_read_ = nullptr;
++  }
++  host_.reset();
++  ReleaseResources();
++}
++
++void GuestFrameTextureSource::ReleaseResources() {
++  Vector<bool> held;
++  Vector<gpu::SyncToken> tokens;
++  for (Slot& slot : slots_) {
++    const bool is_held = slot.state == SlotState::kHeld;
++    // A ready frame nobody read only has to follow its copy; a free slot its
++    // last reader; a slot with a copy pending is released by the browser
++    // after that copy.
++    const gpu::SyncToken token = slot.state == SlotState::kReady
++                                     ? slot.ready_token
++                                     : slot.release_token;
++    held.push_back(is_held);
++    tokens.push_back(is_held ? gpu::SyncToken() : token);
++    if (!is_held) {
++      slot.state = SlotState::kReleased;
++      if (slot.shared_image) {
++        slot.shared_image->UpdateDestructionSyncToken(token);
++        slot.shared_image = nullptr;
++      }
++    }
++  }
++  if (!source_.is_bound()) {
++    return;
++  }
++  source_->Stop(std::move(held), std::move(tokens));
++  if (!CountIn(SlotState::kHeld)) {
++    source_.reset();
+   }
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+@@ -10,8 +10,10 @@
+ #include "gpu/command_buffer/common/sync_token.h"
+ #include "third_party/blink/public/common/tokens/tokens.h"
+ #include "third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom-blink.h"
++#include "third_party/blink/renderer/bindings/core/v8/active_script_wrappable.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_observer.h"
+ #include "third_party/blink/renderer/modules/modules_export.h"
+ #include "third_party/blink/renderer/platform/bindings/script_wrappable.h"
+ #include "third_party/blink/renderer/platform/mojo/heap_mojo_remote.h"
+@@ -38,7 +40,10 @@
+ // frame to read() as a VideoFrame, and gets the slot back when that
+ // VideoFrame is released. All state is on the main thread; the VideoFrame
+ // release callback posts back to it.
+-class MODULES_EXPORT GuestFrameTextureSource final : public ScriptWrappable {
++class MODULES_EXPORT GuestFrameTextureSource final
++    : public ScriptWrappable,
++      public ActiveScriptWrappable<GuestFrameTextureSource>,
++      public ExecutionContextLifecycleObserver {
+   DEFINE_WRAPPERTYPEINFO();
+ 
+  public:
+@@ -59,8 +64,14 @@
+ 
+   void Trace(Visitor*) const override;
+ 
++  // ActiveScriptWrappable: kept alive while a read() is pending.
++  bool HasPendingActivity() const override;
++  // ExecutionContextLifecycleObserver:
++  void ContextDestroyed() override;
++
+  private:
+-  enum class SlotState { kFree, kCopying, kReady, kHeld };
++  // kReleased: given up after close()/end of stream.
++  enum class SlotState { kFree, kCopying, kReady, kHeld, kReleased };
+   struct Slot {
+     scoped_refptr<gpu::ClientSharedImage> shared_image;
+     SlotState state = SlotState::kFree;
+@@ -81,6 +92,9 @@
+   void OnSlotReleased(wtf_size_t index, const gpu::SyncToken& release_token);
+   void MaybeResolveRead();
+   void End();
++  // Stops the browser side and gives up every slot not held by a VideoFrame
++  // (held ones go as their frames are closed, see OnSlotReleased()).
++  void ReleaseResources();
+   wtf_size_t CountIn(SlotState state) const;
+ 
+   Member<ExecutionContext> execution_context_;
+@@ -96,6 +110,8 @@
+   base::TimeTicks last_issue_;
+   bool created_ = false;
+   bool ended_ = false;
++  // close() was called or the stream ended: read() resolves null.
++  bool closed_ = false;
+   bool pump_scheduled_ = false;
+   uint64_t next_sequence_ = 1;
+   // Smoothed time from requesting a copy to receiving it; more copies are
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.idl b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.idl
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.idl
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.idl
+@@ -6,6 +6,7 @@
+ // VideoFrames backed by shared images. Construct with the guest's internal
+ // <iframe>; the browser only accepts a guest owned by the calling document.
+ [
++    ActiveScriptWrappable,
+     Exposed=Window,
+     IsolatedContext
+ ] interface GuestFrameTextureSource {

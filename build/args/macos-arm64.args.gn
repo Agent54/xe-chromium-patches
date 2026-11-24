@@ -1,0 +1,6 @@
+is_debug = false
+dcheck_always_on = false
+symbol_level = 0
+is_component_build = true
+target_cpu = "arm64"
+use_remoteexec = false

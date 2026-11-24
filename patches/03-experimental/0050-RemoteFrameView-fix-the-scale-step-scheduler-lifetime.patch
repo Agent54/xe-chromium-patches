@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Mon, 23 Nov 2026 01:03:46 +0000
+Subject: [PATCH 50/50] RemoteFrameView: fix the scale step scheduler lifetime, near-natural bound and recheck timers
+
+- ScaleStepScheduler was a garbage-collected object held by a function-local
+  static Persistent, which leaks an Oilpan root, and a view that stopped
+  asking could starve small frames forever. It is a plain object keyed by view
+  address; entries expire after 250 ms and are removed in
+  RemoteFrameView::Dispose().
+- The near-natural rule (the frame arrives at its natural scale) had no upper
+  bound, so it defeated the hold whenever the frame was zoomed above 1.0. It
+  now requires frame_to_local_root_scale_factor <= 1.0f + 1e-3f.
+- A shorter recheck (50 ms / 16 ms) is no longer dropped while a longer
+  (300 ms) timer is pending.
+---
+diff --git a/third_party/blink/renderer/core/frame/remote_frame_view.cc b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+--- a/third_party/blink/renderer/core/frame/remote_frame_view.cc
++++ b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+@@ -8,6 +8,7 @@
+ 
+ #include <cmath>
+ 
++#include "base/containers/flat_map.h"
+ #include "base/feature_list.h"
+ #include "base/metrics/field_trial_params.h"
+ #include "base/metrics/histogram_macros.h"
+@@ -83,46 +84,59 @@
+ // scale steps of remote frames over display frames (each step makes the child
+ // re-raster): at most kPerWindow frames per kWindow take a new scale, the
+ // largest waiting ones (on-screen area) first.
+-class ScaleStepScheduler final : public GarbageCollected<ScaleStepScheduler> {
++//
++// Not garbage collected: a function-local static Persistent<> is a leaked
++// Oilpan root. Views are only identified by address (never dereferenced) and
++// removed in RemoteFrameView::Dispose(); entries also expire, so a view that
++// stopped asking cannot starve the others. Main thread only.
++class ScaleStepScheduler final {
+  public:
+   static ScaleStepScheduler& Get() {
+-    static base::NoDestructor<Persistent<ScaleStepScheduler>> instance(
+-        MakeGarbageCollected<ScaleStepScheduler>());
+-    return **instance;
++    static base::NoDestructor<ScaleStepScheduler> instance;
++    return *instance;
+   }
+ 
+-  bool MayStep(RemoteFrameView* view, double area) {
++  bool MayStep(const RemoteFrameView* view, double area) {
+     const base::TimeTicks now = base::TimeTicks::Now();
+     if (now - window_start_ >= kWindow) {
+       window_start_ = now;
+       used_ = 0;
+     }
+-    waiting_.Set(view, area);
++    base::EraseIf(waiting_, [&](const auto& entry) {
++      return now - entry.second.seen > kWaitExpiry;
++    });
++    waiting_[Key(view)] = {area, now};
+     if (used_ >= kPerWindow) {
+       return false;
+     }
+     int larger = 0;
+     for (const auto& entry : waiting_) {
+-      if (entry.value > area) {
++      if (entry.second.area > area) {
+         ++larger;
+       }
+     }
+     if (larger >= kPerWindow - used_) {
+       return false;
+     }
+-    waiting_.erase(view);
++    waiting_.erase(Key(view));
+     ++used_;
+     return true;
+   }
+ 
+-  void Done(RemoteFrameView* view) { waiting_.erase(view); }
+-
+-  void Trace(Visitor* visitor) const { visitor->Trace(waiting_); }
++  void Done(const RemoteFrameView* view) { waiting_.erase(Key(view)); }
+ 
+  private:
++  struct Waiting {
++    double area = 0;
++    base::TimeTicks seen;
++  };
++  static uintptr_t Key(const RemoteFrameView* view) {
++    return reinterpret_cast<uintptr_t>(view);
++  }
+   static constexpr base::TimeDelta kWindow = base::Milliseconds(16);
++  static constexpr base::TimeDelta kWaitExpiry = base::Milliseconds(250);
+   static constexpr int kPerWindow = 4;
+-  HeapHashMap<WeakMember<RemoteFrameView>, double> waiting_;
++  base::flat_map<uintptr_t, Waiting> waiting_;
+   base::TimeTicks window_start_;
+   int used_ = 0;
+ };
+@@ -480,6 +494,7 @@
+       // its will-change: transform hint.
+       const bool near_natural =
+           frame_to_local_root_scale_factor >= std::exp2(-0.25f) - 1e-4f &&
++          frame_to_local_root_scale_factor <= 1.0f + 1e-3f &&
+           (raw > previous_raw ||
+            std::abs(frame_to_local_root_scale_factor - 1.0f) < 1e-3f);
+       const bool step_now =
+@@ -522,8 +537,12 @@
+     }
+     scale_initialized_ = true;
+     compositing_scale_factor_ = applied;
+-    if (recheck && !scale_recheck_pending_) {
++    if (recheck && (!scale_recheck_pending_ ||
++                    now + *recheck < scale_recheck_deadline_)) {
++      // A shorter recheck is not dropped because a longer one is pending (the
++      // later timer then only causes one more harmless recheck).
+       scale_recheck_pending_ = true;
++      scale_recheck_deadline_ = now + *recheck;
+       local_root_view->GetFrame()
+           .GetTaskRunner(TaskType::kInternalDefault)
+           ->PostDelayedTask(FROM_HERE,
+@@ -553,5 +572,6 @@
+ }
+ 
+ void RemoteFrameView::Dispose() {
++  DoneSteppingCompositingScale();
+   HTMLFrameOwnerElement* owner_element = remote_frame_->DeprecatedLocalOwner();
+   // ownerElement can be null during frame swaps, because the
+diff --git a/third_party/blink/renderer/core/frame/remote_frame_view.h b/third_party/blink/renderer/core/frame/remote_frame_view.h
+--- a/third_party/blink/renderer/core/frame/remote_frame_view.h
++++ b/third_party/blink/renderer/core/frame/remote_frame_view.h
+@@ -129,6 +129,7 @@
+   float raw_compositing_scale_factor_ = 0.0f;
+   base::TimeTicks raw_scale_changed_at_;
+   bool scale_recheck_pending_ = false;
++  base::TimeTicks scale_recheck_deadline_;
+   bool scale_initialized_ = false;
+   bool had_will_change_hint_ = false;
+   // Experiment (kStaggerCompositingScaleSteps).

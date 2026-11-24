@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Mon, 23 Nov 2026 00:40:19 +0000
+Subject: [PATCH 47/50] Experiment: step the held compositing scale when a move ends or lands at 1:1 (kStepWhenTransformSettles, kWillChangeTransformHoldsScale)
+
+With kHoldCompositingScaleWhileTransforming the scale step waited 150 ms
+after the transform stopped, so a page opened to 1:1 landed soft and turned
+sharp ~160 ms later. RemoteFrameView::UpdateCompositingScaleFactor() runs on
+every main frame (LocalFrameView::RunPostLifecycleSteps), so:
+
+kStepWhenTransformSettles: the held step is applied at once
+(a) when the frame is within one 2^(1/4) step of its natural scale (the
+    frame-to-local-root scale, i.e. shown 1:1) and still rising, or at it
+    (the re-raster starts a few frames before the landing), or
+(b) when the raw scale has not changed by more than 0.5% since the
+    previous main frame (the move has ended; an ease-out's last frames
+    count as ended).
+The 150 ms settle (delayed re-check) remains as the fallback when no further
+main frame comes.
+
+kWillChangeTransformHoldsScale: 'will-change: transform' on the owner
+element or an ancestor means 'still moving' (rule (b) does not apply);
+removing it steps at once. Blink had no such signal for remote frames
+(compositing_scale_factor ignores will-change; for local layers cc keeps
+the raster scale of will-change: transform layers).
+
+Open scenario (a card 0.3 -> 1.0 in 100/150 ms, exponential ease-out),
+time from landing to the end of the opened guest's re-raster, static cards:
+hold only +156..+190 ms; with (a)+(b) -42..-121 ms (sharp before landing),
+0-0.1 frames over 33 ms per open, 16 and 32 pages. Zooms: zoom-ins sharp
+8-60 ms after the zoom (was 350-470); 32 pages 0.3/0.8 frames over 33 ms
+per 400/120 ms zoom (hold only: 0/0.5).
+---
+diff --git a/third_party/blink/renderer/core/frame/remote_frame_view.cc b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+--- a/third_party/blink/renderer/core/frame/remote_frame_view.cc
++++ b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+@@ -66,6 +66,18 @@
+ BASE_FEATURE(kShortHoldForUpwardScaleSteps, base::FEATURE_DISABLED_BY_DEFAULT);
+ constexpr base::FeatureParam<int> kUpwardHoldMs{&kShortHoldForUpwardScaleSteps,
+                                                 "upward_hold_ms", 50};
++// Experiment: with kHoldCompositingScaleWhileTransforming, step at once
++// (a) when the frame arrives at (within one 2^(1/4) step of) its natural scale
++// - shown 1:1, i.e. about to be read - and is still rising or is there, and
++// (b) as soon as the scale has not changed (by more than 0.5%) since the
++// previous main frame, i.e. the move has ended. The 150 ms settle remains as
++// the fallback when no further main frame comes.
++BASE_FEATURE(kStepWhenTransformSettles, base::FEATURE_DISABLED_BY_DEFAULT);
++// Experiment: with kHoldCompositingScaleWhileTransforming,
++// `will-change: transform` on the frame owner or an ancestor (in the parent
++// local root) means "still moving": the fast settle rule (b) does not apply;
++// removing it steps at once.
++BASE_FEATURE(kWillChangeTransformHoldsScale, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ // Experiment (kStaggerCompositingScaleSteps): spreads compositing
+ // scale steps of remote frames over display frames (each step makes the child
+@@ -427,10 +439,30 @@
+   if (quantize || hold || stagger) {
+     const float raw = compositing_scale_factor_;
+     const base::TimeTicks now = base::TimeTicks::Now();
+-    if (raw != raw_compositing_scale_factor_) {
++    const float previous_raw = raw_compositing_scale_factor_;
++    const bool settle_fast =
++        base::FeatureList::IsEnabled(kStepWhenTransformSettles);
++    const bool raw_changed =
++        settle_fast ? std::abs(raw - previous_raw) > 0.005f * previous_raw
++                    : raw != previous_raw;
++    if (raw != previous_raw) {
+       raw_compositing_scale_factor_ = raw;
++    }
++    if (raw_changed) {
+       raw_scale_changed_at_ = now;
+     }
++    // `will-change: transform` on the owner or an ancestor: still moving.
++    bool will_change_hint = false;
++    if (base::FeatureList::IsEnabled(kWillChangeTransformHoldsScale)) {
++      for (const LayoutObject* o = owner_layout_object; o; o = o->Parent()) {
++        if (o->Style().HasWillChangeTransformProperty()) {
++          will_change_hint = true;
++          break;
++        }
++      }
++    }
++    const bool hint_removed = had_will_change_hint_ && !will_change_hint;
++    had_will_change_hint_ = will_change_hint;
+     float target = raw;
+     if (quantize) {
+       target = std::clamp(
+@@ -443,7 +475,20 @@
+       constexpr base::TimeDelta kHoldSettle = base::Milliseconds(150);
+       constexpr base::TimeDelta kDownSettle = base::Milliseconds(300);
+       const base::TimeDelta stable_for = now - raw_scale_changed_at_;
+-      if (hold) {
++      // (a) arriving at the natural scale (1:1), (b) the move has ended
++      // (no change since the previous main frame), (c) the embedder removed
++      // its will-change: transform hint.
++      const bool near_natural =
++          frame_to_local_root_scale_factor >= std::exp2(-0.25f) - 1e-4f &&
++          (raw > previous_raw ||
++           std::abs(frame_to_local_root_scale_factor - 1.0f) < 1e-3f);
++      const bool step_now =
++          hint_removed ||
++          (settle_fast && (near_natural || (!raw_changed && !will_change_hint &&
++                                            !raw_scale_changed_at_.is_null())));
++      if (hold && step_now) {
++        // Apply `target` now.
++      } else if (hold) {
+         const base::TimeDelta settle =
+             target > previous_scale_factor &&
+                     base::FeatureList::IsEnabled(kShortHoldForUpwardScaleSteps)
+diff --git a/third_party/blink/renderer/core/frame/remote_frame_view.h b/third_party/blink/renderer/core/frame/remote_frame_view.h
+--- a/third_party/blink/renderer/core/frame/remote_frame_view.h
++++ b/third_party/blink/renderer/core/frame/remote_frame_view.h
+@@ -130,6 +130,7 @@
+   base::TimeTicks raw_scale_changed_at_;
+   bool scale_recheck_pending_ = false;
+   bool scale_initialized_ = false;
++  bool had_will_change_hint_ = false;
+   // Experiment (kStaggerCompositingScaleSteps).
+   bool MayStepCompositingScale(double area);
+   void DoneSteppingCompositingScale();

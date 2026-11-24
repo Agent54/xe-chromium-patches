@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 19:19:17 +0000
+Subject: [PATCH 21/50] direct route: revoke pending copies on site change; re-check ownership on completion
+
+A copy result is handed to the renderer only if, when it completes, the
+guest is still owned by the caller (the same check as for issuing it), is
+on the same frame sink, and its main page has not changed site since the
+copy was requested; otherwise the copy is requested again (with a new
+ownership check) or the stream ends.
+
+When the guest's main page changes site (WebContentsObserver::
+PrimaryPageChanged), the source's copies not yet drawn are cancelled in viz
+(CancelKeyedCopyOutputRequests) and requested again for the new page;
+cancellations do not count as failures.
+
+Re-embedding: viz already drops a request whose target surface now has a
+different embed token (CompositorFrameSinkSupport::TakeCopyOutputRequests
+sends kEmbeddingTokenChanged, or never takes it), so a parked request
+cannot be drawn after the guest is attached elsewhere; the source then
+retries with a new ownership check.
+
+Covered by ControlledFrameTextureSourceTest.Lifetime (cross-site navigation
+continues with the new page; removal and renderer crash end the stream).
+---
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+--- a/content/browser/renderer_host/guest_frame_texture_host.cc
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -35,12 +35,15 @@
+ #include "content/browser/renderer_host/render_widget_host_view_child_frame.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/public/browser/document_user_data.h"
++#include "content/public/browser/page.h"
++#include "content/public/browser/web_contents_observer.h"
+ #include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/content_browser_client.h"
+ #include "content/public/common/content_client.h"
+ #include "gpu/command_buffer/client/client_shared_image.h"
+ #include "gpu/command_buffer/client/shared_image_interface.h"
+ #include "gpu/command_buffer/common/shared_image_usage.h"
++#include "net/base/schemeful_site.h"
+ #include "ui/compositor/compositor.h"
+ 
+ namespace content {
+@@ -166,9 +169,11 @@
+ // One source: a ring of browser-allocated shared images for one guest of one
+ // document. Lives while the renderer keeps its remote (or the document).
+ class GuestFrameTextureSourceHostImpl
+-    : public blink::mojom::GuestFrameTextureSourceHost {
++    : public blink::mojom::GuestFrameTextureSourceHost,
++      public WebContentsObserver {
+  public:
+   GuestFrameTextureSourceHostImpl(
++      WebContents* guest_contents,
+       base::WeakPtr<GuestFrameTextureHost> host,
+       const blink::RemoteFrameToken& guest_frame,
+       gfx::Size size,
+@@ -178,7 +183,8 @@
+       bool backpressure,
+       double max_frame_rate,
+       scoped_refptr<UsageAccount> account)
+-      : host_(std::move(host)),
++      : WebContentsObserver(guest_contents),
++        host_(std::move(host)),
+         guest_frame_(guest_frame),
+         size_(size),
+         context_provider_(std::move(context_provider)),
+@@ -190,7 +196,9 @@
+                           : base::TimeDelta()),
+         account_(std::move(account)),
+         in_flight_(images_.size(), false),
+-        release_after_copy_(images_.size()) {
++        release_after_copy_(images_.size()),
++        site_(net::SchemefulSite(guest_contents->GetPrimaryMainFrame()
++                                     ->GetLastCommittedOrigin())) {
+     SetGuestInterval(base::TimeDelta());
+     if (backpressure_ || cap_interval_.is_positive()) {
+       // Also re-applies the cap if the guest's frame sink changes.
+@@ -233,6 +241,21 @@
+     in_flight_[index] = true;
+     ++requests_in_period_;
+     Issue(index, release_sync_token, std::move(callback), /*retries=*/2);
++  }
++
++  // WebContentsObserver: the guest's main page changed. If it is another
++  // site, copies requested for the previous page are cancelled before they
++  // are drawn and requested again (with a new ownership check) for the new
++  // one.
++  void PrimaryPageChanged(Page& page) override {
++    net::SchemefulSite site(
++        page.GetMainDocument().GetLastCommittedOrigin());
++    if (site == site_) {
++      return;
++    }
++    site_ = std::move(site);
++    ++generation_;
++    CancelPendingCopies();
+   }
+ 
+   void Stop(const std::vector<bool>& held,
+@@ -308,7 +331,8 @@
+         viz::CopyOutputRequest::ResultDestination::kSharedImage,
+         base::BindOnce(&GuestFrameTextureSourceHostImpl::OnCopied,
+                        weak_factory_.GetWeakPtr(), index, release_sync_token,
+-                       std::move(callback), retries));
++                       std::move(callback), retries, generation_,
++                       view->GetFrameSinkId()));
+     request->set_result_task_runner(
+         base::SingleThreadTaskRunner::GetCurrentDefault());
+     request->set_area(gfx::Rect(source_size));
+@@ -351,12 +375,35 @@
+                 gpu::SyncToken release_sync_token,
+                 CopyNextFrameCallback callback,
+                 int retries,
++                uint64_t generation,
++                viz::FrameSinkId sink,
+                 std::unique_ptr<viz::CopyOutputResult> result) {
+     if (result->IsEmpty()) {
++      if (!stopped_ && generation != generation_) {
++        // Cancelled because the guest changed site: request again.
++        Issue(index, release_sync_token, std::move(callback), retries);
++        return;
++      }
+       // The guest's frame sink went away (e.g. cross-process navigation of
+-      // the guest): retry on the current one, if the guest still exists.
++      // the guest), or the embedding changed: retry on the current one, if
++      // the guest still exists and is still owned.
+       if (retries > 0 && !stopped_) {
+         Issue(index, release_sync_token, std::move(callback), retries - 1);
++        return;
++      }
++      Reply(index, std::move(callback), false, gpu::SyncToken());
++      return;
++    }
++    // The copy was requested while the guest was owned; it is handed out only
++    // if it still is, on the same frame sink, and the guest has not changed
++    // site since. (Viz itself drops a request whose guest was re-embedded
++    // elsewhere: a different embed token, see
++    // CompositorFrameSinkSupport::TakeCopyOutputRequests.)
++    RenderWidgetHostViewChildFrame* view =
++        host_ ? host_->FindOwnedGuestView(guest_frame_) : nullptr;
++    if (!view || view->GetFrameSinkId() != sink || generation != generation_) {
++      if (view && !stopped_) {
++        Issue(index, release_sync_token, std::move(callback), retries);
+         return;
+       }
+       Reply(index, std::move(callback), false, gpu::SyncToken());
+@@ -430,6 +477,9 @@
+   // Frame sinks this source has sent copy requests to.
+   base::flat_set<viz::FrameSinkId> requested_sinks_;
+   bool stopped_ = false;
++  // Site of the guest's main page; a change cancels pending copies.
++  net::SchemefulSite site_;
++  uint64_t generation_ = 0;
+   base::WeakPtrFactory<GuestFrameTextureSourceHostImpl> weak_factory_{this};
+ };
+ 
+@@ -594,7 +644,7 @@
+                                              /*is_activity=*/false);
+ 
+   sources_.Add(std::make_unique<GuestFrameTextureSourceHostImpl>(
+-                   weak_factory_.GetWeakPtr(), guest_frame, size,
++                   guest_contents, weak_factory_.GetWeakPtr(), guest_frame, size,
+                    std::move(context_provider), std::move(images),
+                    std::move(capture_handle), backpressure, max_frame_rate,
+                    account),

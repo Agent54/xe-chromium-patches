@@ -1,0 +1,915 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 13:30:52 +0000
+Subject: [PATCH 8/50] experiment: direct guest-to-texture route for <controlledframe> (no capture device)
+
+controlledframe.createTextureSource({width, height, maxFrameRate, poolSize})
+returns a GuestFrameTextureSource whose read() resolves with a VideoFrame
+backed by an RGBA shared image that the display compositor filled with the
+guest's pixels (CopyOutputRequest + BlitRequest into a renderer-owned shared
+image; no readback, no media capture device, no format conversion).
+
+- blink.mojom.GuestFrameTextureHost (per frame, DocumentService in content):
+  CopyGuestFrame(RemoteFrameToken, ExportedSharedImage, SyncToken, size,
+  wait_for_new_frame). Only accepts the proxy of an inner (guest)
+  WebContents' main frame whose outer delegate frame is a child of the
+  calling frame; fenced frames and ordinary iframes are refused.
+- viz: CopyOutputRequest::wait_for_new_frame(); CompositorFrameSinkSupport
+  holds such requests until a frame newer than the last one copied for a
+  waiting request activates (damage-driven, one copy per new guest frame).
+- Blink: GuestFrameTextureSource ([IsolatedContext], webcodecs module) with
+  a ring of renderer-allocated shared images, rate cap, release sync tokens.
+- controlled frame bindings: createTextureSource(options).
+---
+diff --git a/chrome/renderer/resources/controlled_frame/html_controlled_frame_element.js b/chrome/renderer/resources/controlled_frame/html_controlled_frame_element.js
+--- a/chrome/renderer/resources/controlled_frame/html_controlled_frame_element.js
++++ b/chrome/renderer/resources/controlled_frame/html_controlled_frame_element.js
+@@ -162,6 +162,23 @@
+         internal.viewInstanceId, names, callback);
+   }
+ 
++  // Experiment: returns a GuestFrameTextureSource whose read()
++  // resolves with VideoFrames backed by GPU shared images that the display
++  // compositor fills with the guest's pixels (no media capture device, no
++  // readback). `options`: width, height, maxFrameRate, poolSize, webgpu.
++  createTextureSource(options) {
++    try {
++      if (!currentGuestId(this)) {
++        return rejectedPromise(new Error('The frame has no guest'));
++      }
++      const internal = privates(this).internal;
++      return $Promise.resolve(
++          new GuestFrameTextureSource(internal.internalElement, options || {}));
++    } catch (e) {
++      return rejectedPromise(e);
++    }
++  }
++
+   // Returns a Promise<MediaStream> with one video track that shows the guest's
+   // contents. `options` may contain maxWidth, maxHeight, maxFrameRate (and
+   // minWidth/minHeight/minFrameRate), passed through as getUserMedia legacy
+diff --git a/chrome/test/data/controlled_frame/resources/expected_properties.json b/chrome/test/data/controlled_frame/resources/expected_properties.json
+--- a/chrome/test/data/controlled_frame/resources/expected_properties.json
++++ b/chrome/test/data/controlled_frame/resources/expected_properties.json
+@@ -16,6 +16,7 @@
+     "constructor",
+     "contentWindow",
+     "contextMenus",
++    "createTextureSource",
+     "executeScript",
+     "focus",
+     "forward",
+diff --git a/components/viz/common/frame_sinks/copy_output_request.h b/components/viz/common/frame_sinks/copy_output_request.h
+--- a/components/viz/common/frame_sinks/copy_output_request.h
++++ b/components/viz/common/frame_sinks/copy_output_request.h
+@@ -152,6 +152,12 @@
+   void set_is_secure(bool is_secure) { is_secure_ = is_secure; }
+   bool is_secure() const { return is_secure_; }
+ 
++  // Experiment: if true, a request sent to a frame sink is held
++  // until the sink activates its next CompositorFrame (i.e. new content),
++  // instead of being satisfied from the current frame.
++  void set_wait_for_new_frame(bool wait) { wait_for_new_frame_ = wait; }
++  bool wait_for_new_frame() const { return wait_for_new_frame_; }
++
+   // Sends the result from executing this request. Called by the internal
+   // implementation, usually a DirectRenderer.
+   void SendResult(std::unique_ptr<CopyOutputResult> result);
+@@ -189,6 +195,7 @@
+   std::optional<BlitRequest> blit_request_;
+ 
+   bool is_secure_ = false;
++  bool wait_for_new_frame_ = false;
+ };
+ 
+ }  // namespace viz
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+@@ -307,6 +307,18 @@
+     UpdateNeedsBeginFramesInternal();
+   }
+ 
++  // Experiment: a new frame activated; release the requests that
++  // waited for one. The surface has damage, so it is aggregated (and the
++  // requests taken) in the next display frame that draws it.
++  ++activation_count_;
++  if (!deferred_copy_output_requests_.empty()) {
++    last_copied_activation_count_ = activation_count_;
++  }
++  for (auto& request : deferred_copy_output_requests_) {
++    copy_output_requests_.push_back(std::move(request));
++  }
++  deferred_copy_output_requests_.clear();
++
+   const CompositorFrameMetadata& active_frame_metadata =
+       surface->GetActiveFrameMetadata();
+   for (const auto& directive : active_frame_metadata.transition_directives) {
+@@ -1446,6 +1458,17 @@
+ 
+ void CompositorFrameSinkSupport::RequestCopyOfOutput(
+     std::unique_ptr<PendingCopyOutputRequest> pending_copy_output_request) {
++  if (pending_copy_output_request->copy_output_request->wait_for_new_frame()) {
++    // Experiment: satisfied from a frame newer than the one the
++    // previous such request copied: right away if one has activated since,
++    // otherwise when the next one activates.
++    if (activation_count_ == last_copied_activation_count_) {
++      deferred_copy_output_requests_.push_back(
++          std::move(pending_copy_output_request));
++      return;
++    }
++    last_copied_activation_count_ = activation_count_;
++  }
+   copy_output_requests_.push_back(std::move(pending_copy_output_request));
+   if (last_activated_surface_id_.is_valid()) {
+     BeginFrameAck ack;
+@@ -1824,6 +1847,7 @@
+   // Upon destruction, the `PendingOutputRequest` will invoke the callback to
+   // return an empty bitmap, signalling that the request is never satisfied.
+   copy_output_requests_.clear();
++  deferred_copy_output_requests_.clear();
+ }
+ 
+ void CompositorFrameSinkSupport::SetLayerContextWantsBeginFrames(
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.h b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.h
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+@@ -455,6 +455,12 @@
+   // PendingCopyOutputRequest::local_surface_id is default initialized, then the
+   // next surface will take it regardless of its LocalSurfaceId.
+   std::vector<std::unique_ptr<PendingCopyOutputRequest>> copy_output_requests_;
++  // Experiment: requests with wait_for_new_frame(), moved to
++  // `copy_output_requests_` when the next frame activates.
++  std::vector<std::unique_ptr<PendingCopyOutputRequest>>
++      deferred_copy_output_requests_;
++  uint64_t activation_count_ = 0;
++  uint64_t last_copied_activation_count_ = 0;
+ 
+   bool callback_received_begin_frame_ = true;
+   bool callback_received_receive_ack_ = true;
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -1681,6 +1681,8 @@
+     "renderer_host/frame_tree.cc",
+     "renderer_host/frame_tree.h",
+     "renderer_host/frame_tree_node.cc",
++    "renderer_host/guest_frame_texture_host.cc",
++    "renderer_host/guest_frame_texture_host.h",
+     "renderer_host/frame_tree_node.h",
+     "renderer_host/global_routing_id.cc",
+     "renderer_host/holding_blocking_idb_lock_handle.cc",
+diff --git a/content/browser/browser_interface_binders.cc b/content/browser/browser_interface_binders.cc
+--- a/content/browser/browser_interface_binders.cc
++++ b/content/browser/browser_interface_binders.cc
+@@ -53,6 +53,7 @@
+ #include "content/browser/process_internals/process_internals_ui.h"
+ #include "content/browser/quota/quota_context.h"
+ #include "content/browser/quota/quota_internals_ui.h"
++#include "content/browser/renderer_host/guest_frame_texture_host.h"
+ #include "content/browser/renderer_host/clipboard_host_impl.h"
+ #include "content/browser/renderer_host/file_utilities_host_impl.h"
+ #include "content/browser/renderer_host/media/media_devices_dispatcher_host.h"
+@@ -1062,6 +1063,9 @@
+       &EmptyBinderForFrame<blink::mojom::ScriptToolHost>);
+   map->Add<blink::mojom::WebInstallService>(
+       &EmptyBinderForFrame<blink::mojom::WebInstallService>);
++  // Experiment: guest pixels as shared images for the embedder.
++  map->Add<blink::mojom::GuestFrameTextureHost>(
++      base::BindRepeating(&GuestFrameTextureHost::Create));
+ 
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+           switches::kExposeInternalsForTesting)) {
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+new file mode 100644
+--- /dev/null
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -0,0 +1,127 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/renderer_host/guest_frame_texture_host.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/task/single_thread_task_runner.h"
++#include "components/viz/common/frame_sinks/blit_request.h"
++#include "components/viz/common/frame_sinks/copy_output_request.h"
++#include "components/viz/common/frame_sinks/copy_output_result.h"
++#include "components/viz/host/host_frame_sink_manager.h"
++#include "content/browser/compositor/surface_utils.h"
++#include "content/browser/renderer_host/frame_tree_node.h"
++#include "content/browser/renderer_host/render_frame_host_impl.h"
++#include "content/browser/renderer_host/render_frame_proxy_host.h"
++#include "content/browser/renderer_host/render_widget_host_view_child_frame.h"
++#include "content/browser/web_contents/web_contents_impl.h"
++#include "gpu/command_buffer/client/client_shared_image.h"
++
++namespace content {
++
++// static
++void GuestFrameTextureHost::Create(
++    RenderFrameHost* render_frame_host,
++    mojo::PendingReceiver<blink::mojom::GuestFrameTextureHost> receiver) {
++  base::MakeSelfDeleting<GuestFrameTextureHost>(*render_frame_host,
++                                                std::move(receiver));
++}
++
++GuestFrameTextureHost::GuestFrameTextureHost(
++    RenderFrameHost& render_frame_host,
++    mojo::PendingReceiver<blink::mojom::GuestFrameTextureHost> receiver,
++    base::SelfDeletingPassKey key)
++    : DocumentService(render_frame_host, std::move(receiver), key) {}
++
++GuestFrameTextureHost::~GuestFrameTextureHost() = default;
++
++RenderWidgetHostViewChildFrame* GuestFrameTextureHost::FindOwnedGuestView(
++    const blink::RemoteFrameToken& guest_frame) {
++  auto* rfh = static_cast<RenderFrameHostImpl*>(&render_frame_host());
++  RenderFrameProxyHost* proxy = RenderFrameProxyHost::FromFrameToken(
++      rfh->GetProcess()->GetDeprecatedID(), guest_frame);
++  if (!proxy) {
++    return nullptr;
++  }
++  FrameTreeNode* inner_root = proxy->frame_tree_node();
++  // Only the main frame of an inner WebContents (a guest), represented in
++  // the caller's process by its proxy to the outer delegate. Fenced frames
++  // and ordinary (cross-origin) iframes are refused.
++  if (!inner_root->IsMainFrame() || inner_root->IsFencedFrameRoot() ||
++      !inner_root->render_manager()->IsMainFrameForInnerDelegate() ||
++      inner_root->render_manager()->GetProxyToOuterDelegate() != proxy) {
++    return nullptr;
++  }
++  FrameTreeNode* outer_delegate =
++      inner_root->render_manager()->GetOuterDelegateNode();
++  if (!outer_delegate || outer_delegate->parent() != rfh) {
++    return nullptr;
++  }
++  auto* guest_contents = WebContentsImpl::FromFrameTreeNode(inner_root);
++  if (!guest_contents || !guest_contents->IsInnerWebContentsForGuest()) {
++    return nullptr;
++  }
++  auto* view = inner_root->current_frame_host()->GetView();
++  if (!view || !view->IsRenderWidgetHostViewChildFrame()) {
++    return nullptr;
++  }
++  return static_cast<RenderWidgetHostViewChildFrame*>(view);
++}
++
++void GuestFrameTextureHost::CopyGuestFrame(
++    const blink::RemoteFrameToken& guest_frame,
++    gpu::ExportedSharedImage destination,
++    const gpu::SyncToken& sync_token,
++    const gfx::Size& size,
++    bool wait_for_new_frame,
++    CopyGuestFrameCallback callback) {
++  RenderWidgetHostViewChildFrame* view = FindOwnedGuestView(guest_frame);
++  if (!view || !view->IsSurfaceAvailableForCopy() || size.IsEmpty()) {
++    std::move(callback).Run(false);
++    return;
++  }
++  const gfx::Size source_size = view->GetCompositorViewportPixelSize();
++  if (source_size.IsEmpty()) {
++    std::move(callback).Run(false);
++    return;
++  }
++  scoped_refptr<gpu::ClientSharedImage> shared_image =
++      gpu::ClientSharedImage::ImportUnowned(std::move(destination));
++  if (!shared_image ||
++      !gfx::Rect(shared_image->size()).Contains(gfx::Rect(size))) {
++    std::move(callback).Run(false);
++    return;
++  }
++
++  auto request = std::make_unique<viz::CopyOutputRequest>(
++      viz::CopyOutputRequest::ResultFormat::RGBA,
++      viz::CopyOutputRequest::ResultDestination::kSharedImage,
++      base::BindOnce(
++          [](CopyGuestFrameCallback callback,
++             std::unique_ptr<viz::CopyOutputResult> result) {
++            std::move(callback).Run(!result->IsEmpty());
++          },
++          std::move(callback)));
++  request->set_result_task_runner(
++      base::SingleThreadTaskRunner::GetCurrentDefault());
++  request->set_area(gfx::Rect(source_size));
++  request->set_result_selection(gfx::Rect(size));
++  request->SetScaleRatio(
++      gfx::Vector2d(source_size.width(), source_size.height()),
++      gfx::Vector2d(size.width(), size.height()));
++  request->set_blit_request(viz::BlitRequest(
++      gfx::Point(), viz::LetterboxingBehavior::kDoNotLetterbox,
++      std::move(shared_image), sync_token,
++      /*populates_mappable_shared_image=*/false));
++  request->set_wait_for_new_frame(wait_for_new_frame);
++
++  GetHostFrameSinkManager()->RequestCopyOfOutput(
++      view->GetCurrentSurfaceId(), std::move(request),
++      /*capture_exact_surface_id=*/false, base::TimeDelta());
++}
++
++}  // namespace content
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.h b/content/browser/renderer_host/guest_frame_texture_host.h
+new file mode 100644
+--- /dev/null
++++ b/content/browser/renderer_host/guest_frame_texture_host.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_RENDERER_HOST_GUEST_FRAME_TEXTURE_HOST_H_
++#define CONTENT_BROWSER_RENDERER_HOST_GUEST_FRAME_TEXTURE_HOST_H_
++
++#include "base/memory/self_deleting.h"
++#include "base/memory/weak_ptr.h"
++#include "content/public/browser/document_service.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom.h"
++
++namespace content {
++
++class RenderFrameHost;
++class RenderWidgetHostViewChildFrame;
++
++// Experiment. Copies a guest's surface (an inner WebContents attached
++// to a child frame of the calling document, e.g. a <controlledframe>) into a
++// shared image owned by the calling renderer, via a viz CopyOutputRequest
++// with a BlitRequest: GPU only, no readback, no media capture device.
++class GuestFrameTextureHost final
++    : public DocumentService<blink::mojom::GuestFrameTextureHost> {
++ public:
++  static void Create(
++      RenderFrameHost* render_frame_host,
++      mojo::PendingReceiver<blink::mojom::GuestFrameTextureHost> receiver);
++
++  GuestFrameTextureHost(
++      RenderFrameHost& render_frame_host,
++      mojo::PendingReceiver<blink::mojom::GuestFrameTextureHost> receiver,
++      base::SelfDeletingPassKey key);
++
++  // blink::mojom::GuestFrameTextureHost:
++  void CopyGuestFrame(const blink::RemoteFrameToken& guest_frame,
++                      gpu::ExportedSharedImage destination,
++                      const gpu::SyncToken& sync_token,
++                      const gfx::Size& size,
++                      bool wait_for_new_frame,
++                      CopyGuestFrameCallback callback) override;
++
++ private:
++  ~GuestFrameTextureHost() final;
++
++  // Returns the guest's view if `guest_frame` is the proxy of an inner
++  // (guest) WebContents' main frame whose outer delegate frame is a child of
++  // this document's frame; nullptr otherwise.
++  RenderWidgetHostViewChildFrame* FindOwnedGuestView(
++      const blink::RemoteFrameToken& guest_frame);
++
++  base::WeakPtrFactory<GuestFrameTextureHost> weak_factory_{this};
++};
++
++}  // namespace content
++
++#endif  // CONTENT_BROWSER_RENDERER_HOST_GUEST_FRAME_TEXTURE_HOST_H_
+diff --git a/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.cc b/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.cc
+--- a/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.cc
++++ b/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.cc
+@@ -161,6 +161,7 @@
+   }
+ 
+   request->set_is_secure(data.is_secure());
++  request->set_wait_for_new_frame(data.wait_for_new_frame());
+ 
+   *out_p = std::move(request);
+ 
+diff --git a/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.h b/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.h
+--- a/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.h
++++ b/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.h
+@@ -67,6 +67,11 @@
+     return request->is_secure();
+   }
+ 
++  static bool wait_for_new_frame(
++      const std::unique_ptr<viz::CopyOutputRequest>& request) {
++    return request->wait_for_new_frame();
++  }
++
+   static mojo::PendingRemote<viz::mojom::CopyOutputResultSender> result_sender(
+       const std::unique_ptr<viz::CopyOutputRequest>& request);
+ 
+diff --git a/services/viz/public/mojom/compositing/copy_output_request.mojom b/services/viz/public/mojom/compositing/copy_output_request.mojom
+--- a/services/viz/public/mojom/compositing/copy_output_request.mojom
++++ b/services/viz/public/mojom/compositing/copy_output_request.mojom
+@@ -26,6 +26,9 @@
+ 
+   bool is_secure;
+ 
++  // Experiment: see CopyOutputRequest::wait_for_new_frame().
++  bool wait_for_new_frame;
++
+   pending_remote<CopyOutputResultSender> result_sender;
+ };
+ 
+diff --git a/third_party/blink/public/mojom/BUILD.gn b/third_party/blink/public/mojom/BUILD.gn
+--- a/third_party/blink/public/mojom/BUILD.gn
++++ b/third_party/blink/public/mojom/BUILD.gn
+@@ -1209,6 +1209,7 @@
+     "messaging/delegated_capability.mojom",
+     "messaging/message_port_descriptor.mojom",
+     "messaging/static_bitmap_image.mojom",
++    "guest_frame_texture/guest_frame_texture.mojom",
+     "messaging/task_attribution_id.mojom",
+     "messaging/transferable_message.mojom",
+     "messaging/user_activation_snapshot.mojom",
+diff --git a/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom b/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
+new file mode 100644
+--- /dev/null
++++ b/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module blink.mojom;
++
++import "gpu/ipc/common/exported_shared_image.mojom";
++import "gpu/ipc/common/sync_token.mojom";
++import "third_party/blink/public/mojom/tokens/tokens.mojom";
++import "ui/gfx/geometry/mojom/geometry.mojom";
++
++// Experiment: lets an embedder frame get the pixels of a guest
++// (an inner WebContents attached to one of its child frames, e.g. a
++// <controlledframe>) copied by the display compositor into a shared image the
++// embedder owns, without a readback. Bound per RenderFrameHost.
++interface GuestFrameTextureHost {
++  // Copies the guest shown in the child remote frame `guest_frame`, scaled to
++  // `size`, into `destination` (RGBA, at least `size`), after waiting on
++  // `sync_token`. If `wait_for_new_frame`, the copy is taken from the guest's
++  // next new frame (damage-driven). Replies `success` = false if the frame is
++  // not an inner guest of the calling frame, has no surface, or went away.
++  CopyGuestFrame(RemoteFrameToken guest_frame,
++                 gpu.mojom.ExportedSharedImage destination,
++                 gpu.mojom.SyncToken sync_token,
++                 gfx.mojom.Size size,
++                 bool wait_for_new_frame) => (bool success);
++};
+diff --git a/third_party/blink/renderer/bindings/generated_in_modules.gni b/third_party/blink/renderer/bindings/generated_in_modules.gni
+--- a/third_party/blink/renderer/bindings/generated_in_modules.gni
++++ b/third_party/blink/renderer/bindings/generated_in_modules.gni
+@@ -1342,6 +1342,8 @@
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_video_frame_metadata.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_video_frame_copy_to_options.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_video_frame_copy_to_options.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_guest_frame_texture_source_init.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_guest_frame_texture_source_init.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_video_frame_init.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_video_frame_init.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_watch_advertisements_options.cc",
+@@ -3021,6 +3023,8 @@
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_video_encoder.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_video_encoder_buffer.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_video_encoder_buffer.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_guest_frame_texture_source.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_guest_frame_texture_source.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_video_frame.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_video_frame.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_video_playback_quality.cc",
+diff --git a/third_party/blink/renderer/bindings/idl_in_modules.gni b/third_party/blink/renderer/bindings/idl_in_modules.gni
+--- a/third_party/blink/renderer/bindings/idl_in_modules.gni
++++ b/third_party/blink/renderer/bindings/idl_in_modules.gni
+@@ -934,6 +934,8 @@
+   "//third_party/blink/renderer/modules/webcodecs/video_encoder_encode_options_for_vp9.idl",
+   "//third_party/blink/renderer/modules/webcodecs/video_encoder_init.idl",
+   "//third_party/blink/renderer/modules/webcodecs/video_encoder_support.idl",
++  "//third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.idl",
++  "//third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl",
+   "//third_party/blink/renderer/modules/webcodecs/video_frame.idl",
+   "//third_party/blink/renderer/modules/webcodecs/video_frame_buffer_init.idl",
+   "//third_party/blink/renderer/modules/webcodecs/video_frame_copy_to_options.idl",
+diff --git a/third_party/blink/renderer/modules/webcodecs/BUILD.gn b/third_party/blink/renderer/modules/webcodecs/BUILD.gn
+--- a/third_party/blink/renderer/modules/webcodecs/BUILD.gn
++++ b/third_party/blink/renderer/modules/webcodecs/BUILD.gn
+@@ -79,6 +79,8 @@
+     "video_encoder.h",
+     "video_encoder_buffer.cc",
+     "video_encoder_buffer.h",
++    "guest_frame_texture_source.cc",
++    "guest_frame_texture_source.h",
+     "video_frame.cc",
+     "video_frame.h",
+     "video_frame_attachment.cc",
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+new file mode 100644
+--- /dev/null
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+@@ -0,0 +1,262 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h"
++
++#include <utility>
++
++#include "base/task/bind_post_task.h"
++#include "components/viz/common/resources/shared_image_format.h"
++#include "gpu/command_buffer/client/client_shared_image.h"
++#include "gpu/command_buffer/client/shared_image_interface.h"
++#include "gpu/command_buffer/common/shared_image_usage.h"
++#include "media/base/video_frame.h"
++#include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
++#include "third_party/blink/public/platform/task_type.h"
++#include "third_party/blink/public/platform/web_graphics_context_3d_provider.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
++#include "third_party/blink/renderer/bindings/modules/v8/v8_guest_frame_texture_source_init.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/frame/remote_frame.h"
++#include "third_party/blink/renderer/core/html/html_iframe_element.h"
++#include "third_party/blink/renderer/modules/webcodecs/video_frame.h"
++#include "third_party/blink/renderer/platform/bindings/exception_state.h"
++#include "third_party/blink/renderer/platform/graphics/gpu/shared_gpu_context.h"
++#include "third_party/blink/renderer/platform/graphics/web_graphics_context_3d_provider_wrapper.h"
++#include "third_party/blink/renderer/platform/heap/persistent.h"
++#include "third_party/blink/renderer/platform/scheduler/public/post_cross_thread_task.h"
++#include "third_party/blink/renderer/platform/wtf/cross_thread_functional.h"
++#include "third_party/blink/renderer/platform/wtf/functional.h"
++
++namespace blink {
++
++// static
++GuestFrameTextureSource* GuestFrameTextureSource::Create(
++    ScriptState* script_state,
++    HTMLIFrameElement* guest,
++    const GuestFrameTextureSourceInit* init,
++    ExceptionState& exception_state) {
++  auto* window = LocalDOMWindow::From(script_state);
++  if (!window || !window->GetFrame()) {
++    exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
++                                      "No frame");
++    return nullptr;
++  }
++  Frame* content = guest ? guest->ContentFrame() : nullptr;
++  if (!content || !content->IsRemoteFrame()) {
++    exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
++                                      "The element does not show a guest");
++    return nullptr;
++  }
++  if (!SharedGpuContext::IsGpuCompositingEnabled()) {
++    exception_state.ThrowDOMException(DOMExceptionCode::kNotSupportedError,
++                                      "GPU compositing is disabled");
++    return nullptr;
++  }
++  if (init->width() == 0 || init->height() == 0 || init->width() > 8192 ||
++      init->height() > 8192 || init->poolSize() < 2 || init->poolSize() > 16) {
++    exception_state.ThrowRangeError("Invalid size or pool size");
++    return nullptr;
++  }
++  return MakeGarbageCollected<GuestFrameTextureSource>(
++      window, content->GetFrameToken().GetAs<RemoteFrameToken>(), init);
++}
++
++GuestFrameTextureSource::GuestFrameTextureSource(
++    ExecutionContext* context,
++    const RemoteFrameToken& token,
++    const GuestFrameTextureSourceInit* init)
++    : execution_context_(context),
++      host_(context),
++      token_(token),
++      width_(init->width()),
++      height_(init->height()),
++      pool_size_(init->poolSize()),
++      webgpu_(init->webgpu()),
++      min_interval_(init->maxFrameRate() > 0
++                        ? base::Seconds(1.0 / init->maxFrameRate())
++                        : base::TimeDelta()) {
++  auto task_runner = context->GetTaskRunner(TaskType::kInternalMedia);
++  context->GetBrowserInterfaceBroker().GetInterface(
++      host_.BindNewPipeAndPassReceiver(task_runner));
++}
++
++GuestFrameTextureSource::~GuestFrameTextureSource() = default;
++
++void GuestFrameTextureSource::Trace(Visitor* visitor) const {
++  visitor->Trace(execution_context_);
++  visitor->Trace(host_);
++  visitor->Trace(pending_read_);
++  ScriptWrappable::Trace(visitor);
++}
++
++bool GuestFrameTextureSource::EnsureSlots() {
++  if (!slots_.empty()) {
++    return true;
++  }
++  auto wrapper = SharedGpuContext::ContextProviderWrapper();
++  if (!wrapper) {
++    return false;
++  }
++  gpu::SharedImageInterface* sii =
++      wrapper->ContextProvider().SharedImageInterface();
++  if (!sii) {
++    return false;
++  }
++  // Written by the display compositor (DISPLAY_WRITE, as a CopyOutputRequest
++  // blit target); read by WebGL/canvas/WebGPU imports of the VideoFrame.
++  gpu::SharedImageUsageSet usage =
++      gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE |
++      gpu::SHARED_IMAGE_USAGE_DISPLAY_READ |
++      gpu::SHARED_IMAGE_USAGE_GLES2_READ | gpu::SHARED_IMAGE_USAGE_RASTER_READ;
++  if (webgpu_) {
++    usage |= gpu::SHARED_IMAGE_USAGE_WEBGPU_READ;
++  }
++  for (uint32_t i = 0; i < pool_size_; ++i) {
++    auto slot = base::MakeRefCounted<Slot>();
++    slot->shared_image = sii->CreateSharedImage(
++        {viz::SinglePlaneFormat::kRGBA_8888, gfx::Size(width_, height_),
++         gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++         kPremul_SkAlphaType, usage, "GuestFrameTextureSource"},
++        gpu::kNullSurfaceHandle);
++    if (!slot->shared_image) {
++      slots_.clear();
++      return false;
++    }
++    slots_.push_back(std::move(slot));
++  }
++  creation_token_ = sii->GenVerifiedSyncToken();
++  return true;
++}
++
++ScriptPromise<IDLNullable<VideoFrame>> GuestFrameTextureSource::read(
++    ScriptState* script_state,
++    ExceptionState& exception_state) {
++  if (pending_read_) {
++    exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
++                                      "A read is already pending");
++    return EmptyPromise();
++  }
++  auto* resolver =
++      MakeGarbageCollected<ScriptPromiseResolver<IDLNullable<VideoFrame>>>(
++          script_state, exception_state.GetContext());
++  auto promise = resolver->Promise();
++  if (closed_) {
++    resolver->Resolve(nullptr);
++    return promise;
++  }
++  if (!EnsureSlots()) {
++    resolver->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kOperationError, "Could not allocate shared images"));
++    return promise;
++  }
++  pending_read_ = resolver;
++  // Rate cap: issue no earlier than `min_interval_` after the previous copy.
++  const base::TimeTicks now = base::TimeTicks::Now();
++  const base::TimeDelta wait = last_issue_.is_null()
++                                   ? base::TimeDelta()
++                                   : last_issue_ + min_interval_ - now;
++  if (wait.is_positive()) {
++    copy_scheduled_ = true;
++    execution_context_->GetTaskRunner(TaskType::kInternalMedia)
++        ->PostDelayedTask(FROM_HERE,
++                          blink::BindOnce(&GuestFrameTextureSource::IssueCopy,
++                                   WrapWeakPersistent(this)),
++                          wait);
++  } else {
++    IssueCopy();
++  }
++  return promise;
++}
++
++void GuestFrameTextureSource::IssueCopy() {
++  copy_scheduled_ = false;
++  if (!pending_read_ || closed_) {
++    return;
++  }
++  scoped_refptr<Slot> slot;
++  gpu::SyncToken wait_token = creation_token_;
++  for (auto& s : slots_) {
++    base::AutoLock lock(s->lock);
++    if (!s->held) {
++      slot = s;
++      if (s->release_token.HasData()) {
++        wait_token = s->release_token;
++      }
++      // Reserved for the copy in flight.
++      s->held = true;
++      break;
++    }
++  }
++  if (!slot) {
++    pending_read_->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kInvalidStateError,
++        "All frames are in use; close() VideoFrames you no longer need"));
++    pending_read_ = nullptr;
++    return;
++  }
++  last_issue_ = base::TimeTicks::Now();
++  const bool wait_for_new_frame = !first_;
++  first_ = false;
++  host_->CopyGuestFrame(
++      token_, slot->shared_image->Export(), wait_token,
++      gfx::Size(width_, height_), wait_for_new_frame,
++      blink::BindOnce(&GuestFrameTextureSource::OnCopied, WrapWeakPersistent(this),
++               slot));
++}
++
++void GuestFrameTextureSource::OnCopied(scoped_refptr<Slot> slot,
++                                       bool success) {
++  if (!success || closed_ || !pending_read_) {
++    {
++      base::AutoLock lock(slot->lock);
++      slot->held = false;
++    }
++    if (pending_read_) {
++      // The guest is gone (or not an owned guest): end of stream.
++      closed_ = !success || closed_;
++      pending_read_->Resolve(nullptr);
++      pending_read_ = nullptr;
++    }
++    return;
++  }
++  // The copy was flushed by the display compositor on the GPU main thread
++  // before the reply was sent; uses of the frame are ordered after it on the
++  // GPU process main thread. Wait on the creation token for the import.
++  auto release_cb = ConvertToBaseOnceCallback(CrossThreadBindOnce(
++      [](scoped_refptr<Slot> slot, const gpu::SyncToken& release_token) {
++        base::AutoLock lock(slot->lock);
++        slot->release_token = release_token;
++        slot->held = false;
++      },
++      slot));
++  auto media_frame = media::VideoFrame::WrapSharedImage(
++      media::PIXEL_FORMAT_ABGR, slot->shared_image, creation_token_,
++      std::move(release_cb), gfx::Rect(width_, height_),
++      gfx::Size(width_, height_),
++      base::TimeTicks::Now() - base::TimeTicks());
++  if (!media_frame) {
++    pending_read_->Reject(MakeGarbageCollected<DOMException>(
++        DOMExceptionCode::kOperationError, "Could not wrap frame"));
++    pending_read_ = nullptr;
++    return;
++  }
++  media_frame->set_color_space(gfx::ColorSpace::CreateSRGB());
++  auto* frame = MakeGarbageCollected<VideoFrame>(std::move(media_frame),
++                                                 execution_context_.Get());
++  pending_read_->Resolve(frame);
++  pending_read_ = nullptr;
++}
++
++void GuestFrameTextureSource::close() {
++  closed_ = true;
++  if (pending_read_) {
++    pending_read_->Resolve(nullptr);
++    pending_read_ = nullptr;
++  }
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+new file mode 100644
+--- /dev/null
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+@@ -0,0 +1,93 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBCODECS_GUEST_FRAME_TEXTURE_SOURCE_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBCODECS_GUEST_FRAME_TEXTURE_SOURCE_H_
++
++#include "base/memory/scoped_refptr.h"
++#include "base/synchronization/lock.h"
++#include "base/time/time.h"
++#include "gpu/command_buffer/common/sync_token.h"
++#include "third_party/blink/public/common/tokens/tokens.h"
++#include "third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom-blink.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
++#include "third_party/blink/renderer/modules/modules_export.h"
++#include "third_party/blink/renderer/platform/bindings/script_wrappable.h"
++#include "third_party/blink/renderer/platform/mojo/heap_mojo_remote.h"
++#include "third_party/blink/renderer/platform/wtf/vector.h"
++
++namespace gpu {
++class ClientSharedImage;
++}
++
++namespace blink {
++
++class ExceptionState;
++class ExecutionContext;
++class GuestFrameTextureSourceInit;
++class HTMLIFrameElement;
++class ScriptState;
++class VideoFrame;
++
++// Experiment. See guest_frame_texture_source.idl.
++class MODULES_EXPORT GuestFrameTextureSource final : public ScriptWrappable {
++  DEFINE_WRAPPERTYPEINFO();
++
++ public:
++  static GuestFrameTextureSource* Create(ScriptState*,
++                                         HTMLIFrameElement* guest,
++                                         const GuestFrameTextureSourceInit*,
++                                         ExceptionState&);
++
++  GuestFrameTextureSource(ExecutionContext*,
++                          const RemoteFrameToken& token,
++                          const GuestFrameTextureSourceInit*);
++  ~GuestFrameTextureSource() override;
++
++  ScriptPromise<IDLNullable<VideoFrame>> read(ScriptState*, ExceptionState&);
++  void close();
++  uint32_t width() const { return width_; }
++  uint32_t height() const { return height_; }
++
++  void Trace(Visitor*) const override;
++
++ private:
++  // A shared image of the ring, shared with the release callbacks of the
++  // VideoFrames handed to script (which may run on other threads).
++  struct Slot : public base::RefCountedThreadSafe<Slot> {
++    scoped_refptr<gpu::ClientSharedImage> shared_image;
++    base::Lock lock;
++    bool held = false;            // GUARDED_BY(lock): a VideoFrame wraps it.
++    gpu::SyncToken release_token;  // GUARDED_BY(lock)
++
++   private:
++    friend class base::RefCountedThreadSafe<Slot>;
++    ~Slot() = default;
++  };
++
++  bool EnsureSlots();
++  void IssueCopy();
++  void OnCopied(scoped_refptr<Slot> slot, bool success);
++
++  Member<ExecutionContext> execution_context_;
++  HeapMojoRemote<mojom::blink::GuestFrameTextureHost> host_;
++  RemoteFrameToken token_;
++  uint32_t width_;
++  uint32_t height_;
++  uint32_t pool_size_;
++  bool webgpu_;
++  base::TimeDelta min_interval_;
++  base::TimeTicks last_issue_;
++  bool first_ = true;
++  bool closed_ = false;
++  bool copy_scheduled_ = false;
++  gpu::SyncToken creation_token_;
++  Vector<scoped_refptr<Slot>> slots_;
++  Member<ScriptPromiseResolver<IDLNullable<VideoFrame>>> pending_read_;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBCODECS_GUEST_FRAME_TEXTURE_SOURCE_H_
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.idl b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.idl
+new file mode 100644
+--- /dev/null
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.idl
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Experiment: GPU-side copies of a guest (<controlledframe>) as
++// VideoFrames backed by shared images. Construct with the guest's internal
++// <iframe>; the browser only accepts a guest owned by the calling document.
++[
++    Exposed=Window,
++    IsolatedContext
++] interface GuestFrameTextureSource {
++  [CallWith=ScriptState, RaisesException]
++  constructor(HTMLIFrameElement guest, optional GuestFrameTextureSourceInit init = {});
++
++  // Resolves with a VideoFrame holding the guest's next new frame (or the
++  // current one for the first call), or null once the guest is gone.
++  [CallWith=ScriptState, RaisesException] Promise<VideoFrame?> read();
++
++  void close();
++
++  readonly attribute unsigned long width;
++  readonly attribute unsigned long height;
++};
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
+new file mode 100644
+--- /dev/null
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
+@@ -0,0 +1,14 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++dictionary GuestFrameTextureSourceInit {
++  [EnforceRange] unsigned long width = 640;
++  [EnforceRange] unsigned long height = 360;
++  // 0 = no cap (one copy per new guest frame).
++  double maxFrameRate = 0;
++  // Number of shared images in the ring (frames held by script + 1 in flight).
++  [EnforceRange] unsigned long poolSize = 3;
++  // Also request WebGPU read usage on the shared images.
++  boolean webgpu = false;
++};

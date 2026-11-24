@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 21:06:58 +0000
+Subject: [PATCH 42/50] Experiment: keep a remote frame's compositing rect while it still holds (kStableRemoteFrameCompositingRect)
+
+RemoteFrameView::ComputeCompositingRect() maps the viewport through the
+frame's transform into the frame (outset by 15%, clamped in size and
+origin) and RemoteFrame::SynchronizeVisualProperties() generates a new
+LocalSurfaceId and sends a new compositor viewport whenever it changes. For
+a frame under a transform that changes every frame - a card being panned,
+zoomed or rotated - it changes on every frame even when the frame is
+entirely visible or entirely off-screen (e.g. a card to the left of or above
+the viewport gets an origin beyond its own size that moves with the pan).
+
+With kStableRemoteFrameCompositingRect (disabled by default),
+UpdateCompositingRect() clips the rect to the frame; keeps the previous rect
+if nothing of the frame is in view, or if the previous rect still contains
+the new one and is at most 4x its area; otherwise snaps the new rect outward
+to a grid of 1/8 of the frame size.
+---
+diff --git a/third_party/blink/renderer/core/frame/remote_frame_view.cc b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+--- a/third_party/blink/renderer/core/frame/remote_frame_view.cc
++++ b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+@@ -49,6 +49,9 @@
+ // Experiment: see RemoteFrameView::UpdateCompositingScaleFactor().
+ BASE_FEATURE(kQuantizeRemoteFrameCompositingScale,
+              base::FEATURE_DISABLED_BY_DEFAULT);
++// Experiment: see RemoteFrameView::UpdateCompositingRect().
++BASE_FEATURE(kStableRemoteFrameCompositingRect,
++             base::FEATURE_DISABLED_BY_DEFAULT);
+ }  // namespace
+ 
+ 
+@@ -255,5 +258,38 @@
+   // avoid large iframes rasterizing their complete viewport.
+   compositing_rect_ = ComputeCompositingRect();
++
++  // Experiment: the rect above follows the viewport through the
++  // frame's transform, so a frame under a moving transform (a card being
++  // panned, zoomed or rotated) gets a new rect - and with it a new
++  // LocalSurfaceId and a new viewport for the child compositor - on every
++  // frame, even when it is entirely visible or entirely off-screen. Keep the
++  // child's rect while that still holds: clip to the frame; if nothing of the
++  // frame is in view, keep the previous rect; if the previous rect still
++  // contains the new one and is at most 4x its area, keep it; otherwise snap
++  // the new one outward to a grid of 1/8 of the frame size.
++  const gfx::Size frame_size = Size();
++  if (base::FeatureList::IsEnabled(kStableRemoteFrameCompositingRect) &&
++      !frame_size.IsEmpty()) {
++    gfx::Rect rect = compositing_rect_;
++    rect.Intersect(gfx::Rect(frame_size));
++    if (rect.IsEmpty() && !previous_rect.IsEmpty()) {
++      rect = previous_rect;
++    } else if (previous_rect.Contains(rect) &&
++               rect.size().Area64() * 4 >= previous_rect.size().Area64()) {
++      rect = previous_rect;
++    } else if (!rect.IsEmpty()) {
++      const int gx = std::max(1, frame_size.width() / 8);
++      const int gy = std::max(1, frame_size.height() / 8);
++      const int x0 = rect.x() / gx * gx;
++      const int y0 = rect.y() / gy * gy;
++      const int x1 = std::min(frame_size.width(),
++                              (rect.right() + gx - 1) / gx * gx);
++      const int y1 = std::min(frame_size.height(),
++                              (rect.bottom() + gy - 1) / gy * gy);
++      rect = gfx::Rect(x0, y0, x1 - x0, y1 - y0);
++    }
++    compositing_rect_ = rect;
++  }
+ 
+   if (compositing_rect_ != previous_rect) {
+     SetNeedsFrameRectPropagation();

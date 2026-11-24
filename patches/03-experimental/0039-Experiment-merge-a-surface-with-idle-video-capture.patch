@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 21:06:41 +0000
+Subject: [PATCH 39/50] Experiment: merge a surface with idle video capture (kMergeSurfacesWithIdleCapture)
+
+SurfaceAggregator::EmitSurfaceContent() kept every surface whose client has
+video capture enabled (a FrameSinkVideoCapturer, e.g. captureStream() of a
+<controlledframe>) in its own render pass in every frame
+(has_video_capture = HasCopyOutputRequests() ||
+IsVideoCaptureOnFromClient()), as a hint that a copy request will come soon.
+With kMergeSurfacesWithIdleCapture (disabled by default) only a copy request
+in this frame does: in frames without one the surface merges like any other
+(if it otherwise can), and AggregatedRenderPass::video_capture_enabled is
+set only on a pass that is not merged (the CHECK(!merge_pass) becomes a
+condition).
+---
+diff --git a/components/viz/common/features.cc b/components/viz/common/features.cc
+--- a/components/viz/common/features.cc
++++ b/components/viz/common/features.cc
+@@ -63,6 +63,12 @@
+ BASE_FEATURE(kVizBufferQueueDiscardOnVisibilityChange,
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ 
++// Experiment: a surface whose client has video capture enabled
++// (FrameSinkVideoCapturer) is merged into its embedding pass like any other in
++// display frames that have no copy request for it, instead of always getting
++// its own render pass.
++BASE_FEATURE(kMergeSurfacesWithIdleCapture, base::FEATURE_DISABLED_BY_DEFAULT);
++
+ // If enabled, VideoConferenceMatcher does not lower the display frame rate
+ // while other (non-video) content in the window updates on (nearly) every
+ // display frame or faster than the interval it would pick, e.g. an animating
+diff --git a/components/viz/common/features.h b/components/viz/common/features.h
+--- a/components/viz/common/features.h
++++ b/components/viz/common/features.h
+@@ -72,6 +72,7 @@
+ #endif
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kUseDrmBlackFullscreenOptimization);
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kVideoConferenceMatcherYieldsToAnimation);
++VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kMergeSurfacesWithIdleCapture);
+ #if BUILDFLAG(IS_ANDROID)
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(
+     kUseFrameIntervalDeciderAdaptiveFrameRate);
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -895,8 +895,12 @@
+   // require an intermediate surface. However, video capture being enabled is a
+   // hint that we will have a copy request soon, so we prevent |merge_pass| to
+   // avoid thrashing on the render pass backing allocation.
+-  const bool has_video_capture = resolved_frame.HasCopyOutputRequests() ||
+-                                 surface->IsVideoCaptureOnFromClient();
++  // Experiment (kMergeSurfacesWithIdleCapture): only an actual copy
++  // request in this frame keeps the surface in its own pass.
++  const bool has_video_capture =
++      resolved_frame.HasCopyOutputRequests() ||
++      (surface->IsVideoCaptureOnFromClient() &&
++       !base::FeatureList::IsEnabled(features::kMergeSurfacesWithIdleCapture));
+ 
+   const bool merge_pass = pass_is_mergeable && !has_video_capture;
+ 
+@@ -1010,8 +1014,7 @@
+     dest_pass_list_->push_back(std::move(copy_pass));
+   }
+ 
+-  if (surface->IsVideoCaptureOnFromClient()) {
+-    CHECK(!merge_pass);
++  if (surface->IsVideoCaptureOnFromClient() && !merge_pass) {
+     dest_pass_list_->back()->video_capture_enabled = true;
+   }
+ 

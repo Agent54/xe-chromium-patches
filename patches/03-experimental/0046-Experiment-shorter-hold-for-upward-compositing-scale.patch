@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Mon, 23 Nov 2026 00:40:18 +0000
+Subject: [PATCH 46/50] Experiment: shorter hold for upward compositing-scale steps (kShortHoldForUpwardScaleSteps)
+
+With kHoldCompositingScaleWhileTransforming, an upward step (zoom-in: the
+case that leaves a card soft) is applied after the scale has been stable
+for upward_hold_ms (default 50 ms) instead of 150 ms; downward steps keep
+150 ms.
+
+Strict zoom test, 10 traced zooms (time to the last re-raster after a
+zoom-in, base -> this): 32 pages 350-470 -> 105-190 ms, 16 pages ~190 ->
+87-160 ms; frames over 33 ms per zoom unchanged within noise (32 pages
+0/0.5 -> 0/0.8 for 400/120 ms zooms).
+---
+diff --git a/third_party/blink/renderer/core/frame/remote_frame_view.cc b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+--- a/third_party/blink/renderer/core/frame/remote_frame_view.cc
++++ b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+@@ -9,8 +9,9 @@
+ #include <cmath>
+ 
+ #include "base/feature_list.h"
++#include "base/metrics/field_trial_params.h"
++#include "base/metrics/histogram_macros.h"
+ #include "base/no_destructor.h"
+-#include "base/metrics/histogram_macros.h"
+ #include "base/trace_event/trace_event.h"
+ #include "components/paint_preview/common/paint_preview_tracker.h"
+ #include "printing/buildflags/buildflags.h"
+@@ -59,6 +60,12 @@
+ BASE_FEATURE(kHoldCompositingScaleWhileTransforming,
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ BASE_FEATURE(kStaggerCompositingScaleSteps, base::FEATURE_DISABLED_BY_DEFAULT);
++// Experiment: with kHoldCompositingScaleWhileTransforming, an upward
++// step (zoom-in, the case that leaves a card soft) waits only
++// kUpwardHoldMs after the scale stops changing; downward steps keep 150 ms.
++BASE_FEATURE(kShortHoldForUpwardScaleSteps, base::FEATURE_DISABLED_BY_DEFAULT);
++constexpr base::FeatureParam<int> kUpwardHoldMs{&kShortHoldForUpwardScaleSteps,
++                                                "upward_hold_ms", 50};
+ 
+ // Experiment (kStaggerCompositingScaleSteps): spreads compositing
+ // scale steps of remote frames over display frames (each step makes the child
+@@ -437,9 +444,14 @@
+       constexpr base::TimeDelta kDownSettle = base::Milliseconds(300);
+       const base::TimeDelta stable_for = now - raw_scale_changed_at_;
+       if (hold) {
+-        if (stable_for < kHoldSettle) {
++        const base::TimeDelta settle =
++            target > previous_scale_factor &&
++                    base::FeatureList::IsEnabled(kShortHoldForUpwardScaleSteps)
++                ? base::Milliseconds(kUpwardHoldMs.Get())
++                : kHoldSettle;
++        if (stable_for < settle) {
+           applied = previous_scale_factor;
+-          recheck = kHoldSettle - stable_for;
++          recheck = settle - stable_for;
+         }
+       } else if (quantize && target < previous_scale_factor) {
+         if (raw > previous_scale_factor / std::sqrt(2.0f) + 1e-4f) {

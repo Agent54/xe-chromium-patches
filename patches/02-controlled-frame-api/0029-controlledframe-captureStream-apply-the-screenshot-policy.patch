@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 20:18:03 +0000
+Subject: [PATCH 29/50] controlledframe.captureStream(): apply the screenshot policy and the ownership check
+
+GetCaptureStreamId only checked that the caller owns the guest. It now also
+requires that the guest is owned by a Controlled Frame embedder and asks
+ContentBrowserClient::MayReadGuestFramePixels(), which applies the
+Controlled Frame permissions policy and the screenshot restriction
+(kDisableScreenshots) that captureVisibleRegion() follows, so a policy that
+forbids screenshots also forbids captureStream().
+
+Test: ControlledFrameTextureSourceTest.Ownership also checks that
+captureStream() rejects while screenshots are disabled by policy.
+---
+diff --git a/chrome/browser/controlled_frame/controlled_frame_apitest.cc b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+--- a/chrome/browser/controlled_frame/controlled_frame_apitest.cc
++++ b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+@@ -1007,6 +1007,16 @@
+       if (vf) { vf.close(); return 'got a frame'; }
+       return 'no frame';
+     })();)"));
++  // captureStream() follows the same policy.
++  EXPECT_EQ("rejected", content::EvalJs(app_frame, R"(
++    (async () => {
++      try {
++        await document.querySelector('controlledframe').captureStream();
++        return 'resolved';
++      } catch (e) {
++        return 'rejected';
++      }
++    })();)"));
+   prefs->SetBoolean(policy::policy_prefs::kDisableScreenshots, false);
+ 
+   // A cross-origin iframe that is not a guest is refused (the source ends
+diff --git a/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc b/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
+--- a/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
++++ b/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
+@@ -22,6 +22,7 @@
+ #include "base/values.h"
+ #include "components/crash/core/common/crash_key.h"
+ #include "content/public/browser/browser_context.h"
++#include "content/public/browser/content_browser_client.h"
+ #include "content/public/browser/desktop_media_id.h"
+ #include "content/public/browser/desktop_streams_registry.h"
+ #include "content/public/browser/frame_rate_throttling.h"
+@@ -30,6 +31,7 @@
+ #include "content/public/browser/render_view_host.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_media_capture_id.h"
++#include "content/public/common/content_client.h"
+ #include "content/public/common/stop_find_action.h"
+ #include "content/public/common/url_constants.h"
+ #include "extensions/browser/extension_api_frame_id_map.h"
+@@ -346,6 +348,16 @@
+   if (!guest_main_frame || !guest_contents ||
+       guest_contents == embedder_contents) {
+     return RespondNow(Error("Capture is not supported for this guest"));
++  }
++
++  // Same authorization as reading the guest's pixels through
++  // GuestFrameTextureSource: a guest owned by a Controlled Frame embedder, and
++  // not when screenshots are restricted by policy (kDisableScreenshots), as
++  // for captureVisibleRegion().
++  if (!guest.IsOwnedByControlledFrameEmbedder() ||
++      !content::GetContentClient()->browser()->MayReadGuestFramePixels(
++          caller, guest_contents)) {
++    return RespondNow(Error("Capture is not allowed for this guest"));
+   }
+ 
+   content::DesktopMediaID source(

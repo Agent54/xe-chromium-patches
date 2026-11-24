@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 10:23:19 +0000
+Subject: [PATCH 7/50] controlledframe capture: no sharing infobar for captures of an embedded guest
+
+DesktopCaptureAccessHandler passes display_notification=false when the
+captured WebContents is an inner WebContents of the requesting WebContents.
+The browser test checks that no infobar is added.
+---
+diff --git a/chrome/browser/controlled_frame/controlled_frame_apitest.cc b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+--- a/chrome/browser/controlled_frame/controlled_frame_apitest.cc
++++ b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+@@ -32,6 +32,8 @@
+ #include "components/content_settings/core/common/content_settings.h"
+ #include "components/embedder_support/user_agent_utils.h"
+ #include "components/guest_view/browser/guest_view_manager_delegate.h"
++#include "components/infobars/content/content_infobar_manager.h"
++#include "components/infobars/core/infobar_manager.h"
+ #include "components/guest_view/browser/test_guest_view_manager.h"
+ #include "components/policy/core/common/policy_pref_names.h"
+ #include "components/prefs/pref_service.h"
+@@ -757,6 +759,12 @@
+           JSON.stringify(frame.getBoundingClientRect());
+     })();
+   )"));
++
++  // Capturing an embedded guest shows no "Sharing ... to this tab" infobar.
++  EXPECT_EQ(0u, infobars::ContentInfoBarManager::FromWebContents(
++                    content::WebContents::FromRenderFrameHost(app_frame))
++                    ->infobars()
++                    .size());
+ 
+   // Obtain a second stream id without consuming it: the element passes the
+   // id to navigator.mediaDevices.getUserMedia() in the page's world.
+diff --git a/chrome/browser/media/webrtc/desktop_capture_access_handler.cc b/chrome/browser/media/webrtc/desktop_capture_access_handler.cc
+index 99ef395..bd4fd40 100644
+--- a/chrome/browser/media/webrtc/desktop_capture_access_handler.cc
++++ b/chrome/browser/media/webrtc/desktop_capture_access_handler.cc
+@@ -41,6 +41,10 @@
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/content_switches.h"
+ #include "extensions/browser/app_window/app_window.h"
++#include "extensions/buildflags/buildflags.h"
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#include "extensions/browser/guest_view/web_view/web_view_guest.h"
++#endif
+ #include "extensions/browser/app_window/app_window_registry.h"
+ #include "extensions/common/constants.h"
+ #include "extensions/common/extension.h"
+@@ -128,6 +132,31 @@ gfx::NativeWindow FindParentWindowForWebContents(
+ }
+ #endif
+ 
++// True if `media_id` captures a guest (inner WebContents, e.g. a
++// <controlledframe>) embedded in `web_contents`. The embedder already controls
++// what the guest shows, so no "Sharing ... to this tab" UI is shown for it.
++bool IsCaptureOfEmbeddedGuest(content::WebContents* web_contents,
++                              const content::DesktopMediaID& media_id) {
++  if (media_id.type != content::DesktopMediaID::TYPE_WEB_CONTENTS) {
++    return false;
++  }
++  content::WebContents* captured = content::WebContents::FromRenderFrameHost(
++      content::RenderFrameHost::FromID(
++          media_id.web_contents_id.render_process_id,
++          media_id.web_contents_id.main_render_frame_id));
++  if (!captured || captured->GetOuterWebContents() != web_contents) {
++    return false;
++  }
++  // Only <webview> / <controlledframe> guests. Other guests embedded in the
++  // page (e.g. the PDF viewer's MimeHandlerViewGuest) must keep the sharing
++  // UI.
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  return extensions::WebViewGuest::FromWebContents(captured) != nullptr;
++#else
++  return false;
++#endif
++}
++
+ bool IsMediaTypeAllowed(AllowedScreenCaptureLevel allowed_capture_level,
+                         content::DesktopMediaID::Type media_type) {
+   switch (media_type) {
+@@ -817,7 +846,8 @@ void DesktopCaptureAccessHandler::AcceptRequest(
+       pending_request->request.disable_local_echo,
+       /*suppress_local_audio_playback=*/false,
+       /*restrict_own_audio=*/false,
+-      pending_request->should_display_notification,
++      pending_request->should_display_notification &&
++          !IsCaptureOfEmbeddedGuest(web_contents, media_id),
+       pending_request->application_title,
+       pending_request->request.captured_surface_control_active);
+ 

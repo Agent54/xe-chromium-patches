@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 14:44:53 +0000
+Subject: [PATCH 9/50] direct route hardening (viz): per-request new-frame key, copy sync token
+
+- CopyOutputRequest::wait_for_new_frame_key (UnguessableToken) replaces the
+  per-frame-sink bool: CompositorFrameSinkSupport remembers per key the last
+  activation it copied; a request is taken at once if a newer frame has
+  activated and no older request of the key waits, otherwise when the next
+  frame activates, releasing one request per key per activation. Two
+  sources on one guest no longer starve each other, and several in-flight
+  requests of one source get successive frames.
+- For a keyed copy into a non-mappable blit destination,
+  SkiaOutputSurfaceImpl generates a sync token, flushes the GPU tasks with
+  it released right after the copy task, and the result carries it
+  (CopyOutputResult::sync_token, serialized in viz.mojom.CopyOutputResult).
+---
+diff --git a/components/viz/common/frame_sinks/copy_output_request.h b/components/viz/common/frame_sinks/copy_output_request.h
+--- a/components/viz/common/frame_sinks/copy_output_request.h
++++ b/components/viz/common/frame_sinks/copy_output_request.h
+@@ -152,11 +152,27 @@
+   void set_is_secure(bool is_secure) { is_secure_ = is_secure; }
+   bool is_secure() const { return is_secure_; }
+ 
+-  // Experiment: if true, a request sent to a frame sink is held
+-  // until the sink activates its next CompositorFrame (i.e. new content),
+-  // instead of being satisfied from the current frame.
+-  void set_wait_for_new_frame(bool wait) { wait_for_new_frame_ = wait; }
+-  bool wait_for_new_frame() const { return wait_for_new_frame_; }
++  // Experiment: if set, a request sent to a frame sink is satisfied
++  // from a frame newer than the one the previous request with the same key
++  // copied (held until such a frame activates). Requests with the same key
++  // get distinct, successive frames.
++  void set_wait_for_new_frame_key(
++      std::optional<base::UnguessableToken> key) {
++    wait_for_new_frame_key_ = std::move(key);
++  }
++  const std::optional<base::UnguessableToken>& wait_for_new_frame_key() const {
++    return wait_for_new_frame_key_;
++  }
++
++  // Experiment (viz-internal, not serialized): sync token released on
++  // the display compositor's GPU sequence after the copy into a non-mappable
++  // blit destination; returned in the result's sync_token().
++  void set_release_sync_token(const gpu::SyncToken& token) {
++    release_sync_token_ = token;
++  }
++  const gpu::SyncToken& release_sync_token() const {
++    return release_sync_token_;
++  }
+ 
+   // Sends the result from executing this request. Called by the internal
+   // implementation, usually a DirectRenderer.
+@@ -195,7 +211,8 @@
+   std::optional<BlitRequest> blit_request_;
+ 
+   bool is_secure_ = false;
+-  bool wait_for_new_frame_ = false;
++  std::optional<base::UnguessableToken> wait_for_new_frame_key_;
++  gpu::SyncToken release_sync_token_;
+ };
+ 
+ }  // namespace viz
+diff --git a/components/viz/common/frame_sinks/copy_output_result.h b/components/viz/common/frame_sinks/copy_output_result.h
+--- a/components/viz/common/frame_sinks/copy_output_result.h
++++ b/components/viz/common/frame_sinks/copy_output_result.h
+@@ -20,6 +20,7 @@
+ #include "gpu/command_buffer/client/client_shared_image.h"
+ #include "gpu/command_buffer/client/shared_image_interface.h"
+ #include "gpu/command_buffer/common/mailbox.h"
++#include "gpu/command_buffer/common/sync_token.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+ #include "ui/gfx/color_space.h"
+ #include "ui/gfx/geometry/rect.h"
+@@ -218,6 +219,12 @@
+     return tracked_element_rects_;
+   }
+ 
++  // Experiment: for kSharedImage results written into a caller's
++  // blit destination, a sync token released after the GPU work that wrote
++  // it (empty if not provided). Readers of the destination wait on it.
++  void set_sync_token(const gpu::SyncToken& token) { sync_token_ = token; }
++  const gpu::SyncToken& sync_token() const { return sync_token_; }
++
+  protected:
+   // Lock the content of SkBitmap returned from AsSkBitmap() call.
+   // Return true, if lock operation is successful, implementations should
+@@ -253,6 +260,7 @@
+   mutable SkBitmap cached_bitmap_;
+ 
+   TrackedElementRects tracked_element_rects_;
++  gpu::SyncToken sync_token_;
+ };
+ 
+ // Subclass of CopyOutputResult that provides a RGBA result from an
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+@@ -1042,12 +1042,27 @@
+                                  sync_tokens.begin(), sync_tokens.end());
+   }
+ 
++  // Experiment: give a copy into a caller's non-mappable blit
++  // destination a sync token that is released right after the GPU task that
++  // writes it, so the caller's readers can wait on it.
++  gpu::SyncToken copy_release_token;
++  if (request->has_blit_request() &&
++      !request->blit_request().populates_mappable_shared_image() &&
++      request->wait_for_new_frame_key()) {
++    copy_release_token = shared_image_interface_->GenNextSyncToken();
++    copy_release_token.SetVerifyFlush();
++    request->set_release_sync_token(copy_release_token);
++  }
++
+   auto callback = base::BindOnce(&SkiaOutputSurfaceImplOnGpu::CopyOutput,
+                                  base::Unretained(impl_on_gpu_.get()), geometry,
+                                  color_space, std::move(request), mailbox,
+                                  std::move(release_callback));
+   EnqueueGpuTask(std::move(callback), std::move(resource_sync_tokens_),
+                  /*make_current=*/true, /*need_framebuffer=*/mailbox.IsZero());
++  if (copy_release_token.HasData()) {
++    FlushGpuTasks(SyncMode::kNoWait, copy_release_token);
++  }
+ }
+ 
+ void SkiaOutputSurfaceImpl::ScheduleOverlays(
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -1106,10 +1106,14 @@
+     scoped_write.reset();
+ 
+     if (request->has_blit_request()) {
+-      request->SendResult(std::make_unique<CopyOutputSharedImageResult>(
++      auto result = std::make_unique<CopyOutputSharedImageResult>(
+           CopyOutputResult::Format::RGBA, geometry.result_selection,
+           request->blit_request().shared_image(),
+-          std::move(blit_release_callback)));
++          std::move(blit_release_callback));
++      // Experiment: released after this GPU task (see
++      // SkiaOutputSurfaceImpl::CopyOutput).
++      result->set_sync_token(request->release_sync_token());
++      request->SendResult(std::move(result));
+     } else {
+       DCHECK(!blit_release_callback);
+       // Grab the mailbox before we transfer `representation`'s ownership:
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+@@ -310,14 +310,24 @@
+   // Experiment: a new frame activated; release the requests that
+   // waited for one. The surface has damage, so it is aggregated (and the
+   // requests taken) in the next display frame that draws it.
++  // Per key, release only the oldest waiting request, so that several
++  // requests of one key get successive frames.
+   ++activation_count_;
+   if (!deferred_copy_output_requests_.empty()) {
+-    last_copied_activation_count_ = activation_count_;
++    base::flat_set<base::UnguessableToken> released_keys;
++    std::vector<std::unique_ptr<PendingCopyOutputRequest>> still_waiting;
++    for (auto& request : deferred_copy_output_requests_) {
++      const base::UnguessableToken& key =
++          *request->copy_output_request->wait_for_new_frame_key();
++      if (released_keys.insert(key).second) {
++        last_copied_activation_by_key_[key] = activation_count_;
++        copy_output_requests_.push_back(std::move(request));
++      } else {
++        still_waiting.push_back(std::move(request));
++      }
++    }
++    deferred_copy_output_requests_ = std::move(still_waiting);
+   }
+-  for (auto& request : deferred_copy_output_requests_) {
+-    copy_output_requests_.push_back(std::move(request));
+-  }
+-  deferred_copy_output_requests_.clear();
+ 
+   const CompositorFrameMetadata& active_frame_metadata =
+       surface->GetActiveFrameMetadata();
+@@ -1458,16 +1468,26 @@
+ 
+ void CompositorFrameSinkSupport::RequestCopyOfOutput(
+     std::unique_ptr<PendingCopyOutputRequest> pending_copy_output_request) {
+-  if (pending_copy_output_request->copy_output_request->wait_for_new_frame()) {
++  if (const auto& key = pending_copy_output_request->copy_output_request
++                            ->wait_for_new_frame_key()) {
+     // Experiment: satisfied from a frame newer than the one the
+-    // previous such request copied: right away if one has activated since,
+-    // otherwise when the next one activates.
+-    if (activation_count_ == last_copied_activation_count_) {
++    // previous request with this key copied: right away if one has activated
++    // since (and no older request of this key is waiting), otherwise when the
++    // next one activates.
++    auto it = last_copied_activation_by_key_.find(*key);
++    const bool newer_available =
++        it == last_copied_activation_by_key_.end() ||
++        it->second < activation_count_;
++    const bool key_waiting = std::ranges::any_of(
++        deferred_copy_output_requests_, [&](const auto& r) {
++          return *r->copy_output_request->wait_for_new_frame_key() == *key;
++        });
++    if (!newer_available || key_waiting) {
+       deferred_copy_output_requests_.push_back(
+           std::move(pending_copy_output_request));
+       return;
+     }
+-    last_copied_activation_count_ = activation_count_;
++    last_copied_activation_by_key_[*key] = activation_count_;
+   }
+   copy_output_requests_.push_back(std::move(pending_copy_output_request));
+   if (last_activated_surface_id_.is_valid()) {
+@@ -1848,6 +1868,7 @@
+   // return an empty bitmap, signalling that the request is never satisfied.
+   copy_output_requests_.clear();
+   deferred_copy_output_requests_.clear();
++  last_copied_activation_by_key_.clear();
+ }
+ 
+ void CompositorFrameSinkSupport::SetLayerContextWantsBeginFrames(
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.h b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.h
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+@@ -12,7 +12,9 @@
+ #include <vector>
+ 
+ #include "base/containers/circular_deque.h"
++#include "base/containers/flat_map.h"
+ #include "base/containers/flat_set.h"
++#include "base/unguessable_token.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/read_only_shared_memory_region.h"
+@@ -460,7 +462,8 @@
+   std::vector<std::unique_ptr<PendingCopyOutputRequest>>
+       deferred_copy_output_requests_;
+   uint64_t activation_count_ = 0;
+-  uint64_t last_copied_activation_count_ = 0;
++  base::flat_map<base::UnguessableToken, uint64_t>
++      last_copied_activation_by_key_;
+ 
+   bool callback_received_begin_frame_ = true;
+   bool callback_received_receive_ack_ = true;
+diff --git a/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.cc b/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.cc
+--- a/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.cc
++++ b/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.cc
+@@ -161,7 +161,11 @@
+   }
+ 
+   request->set_is_secure(data.is_secure());
+-  request->set_wait_for_new_frame(data.wait_for_new_frame());
++  std::optional<base::UnguessableToken> wait_key;
++  if (!data.ReadWaitForNewFrameKey(&wait_key)) {
++    return base::unexpected(DeserializationError());
++  }
++  request->set_wait_for_new_frame_key(std::move(wait_key));
+ 
+   *out_p = std::move(request);
+ 
+diff --git a/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.h b/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.h
+--- a/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.h
++++ b/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.h
+@@ -67,9 +67,9 @@
+     return request->is_secure();
+   }
+ 
+-  static bool wait_for_new_frame(
++  static const std::optional<base::UnguessableToken>& wait_for_new_frame_key(
+       const std::unique_ptr<viz::CopyOutputRequest>& request) {
+-    return request->wait_for_new_frame();
++    return request->wait_for_new_frame_key();
+   }
+ 
+   static mojo::PendingRemote<viz::mojom::CopyOutputResultSender> result_sender(
+diff --git a/services/viz/public/cpp/compositing/copy_output_result_mojom_traits.cc b/services/viz/public/cpp/compositing/copy_output_result_mojom_traits.cc
+--- a/services/viz/public/cpp/compositing/copy_output_result_mojom_traits.cc
++++ b/services/viz/public/cpp/compositing/copy_output_result_mojom_traits.cc
+@@ -358,9 +358,14 @@
+                 base::BindOnce(&Release, std::move(releaser), shared_image);
+           }
+ 
++          gpu::SyncToken sync_token;
++          if (!data.ReadSyncToken(&sync_token)) {
++            return false;
++          }
+           *out_p = std::make_unique<viz::CopyOutputSharedImageResult>(
+               viz::CopyOutputResult::Format::RGBA, rect,
+               std::move(shared_image), std::move(release_callback));
++          (*out_p)->set_sync_token(sync_token);
+           return true;
+         }
+       }
+diff --git a/services/viz/public/cpp/compositing/copy_output_result_mojom_traits.h b/services/viz/public/cpp/compositing/copy_output_result_mojom_traits.h
+--- a/services/viz/public/cpp/compositing/copy_output_result_mojom_traits.h
++++ b/services/viz/public/cpp/compositing/copy_output_result_mojom_traits.h
+@@ -15,6 +15,7 @@
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "services/viz/public/cpp/compositing/bitmap_in_shared_memory_mojom_traits.h"
+ #include "services/viz/public/cpp/compositing/tracked_element_rects_mojom_traits.h"
++#include "gpu/ipc/common/sync_token_mojom_traits.h"
+ #include "services/viz/public/mojom/compositing/copy_output_result.mojom-shared.h"
+ #include "services/viz/public/mojom/compositing/texture_releaser.mojom.h"
+ #include "ui/gfx/geometry/mojom/geometry_mojom_traits.h"
+@@ -82,5 +83,10 @@
+   static const viz::TrackedElementRects& tracked_element_rects(
+       const std::unique_ptr<viz::CopyOutputResult>& result);
++
++  static const gpu::SyncToken& sync_token(
++      const std::unique_ptr<viz::CopyOutputResult>& result) {
++    return result->sync_token();
++  }
+ 
+   static bool Read(viz::mojom::CopyOutputResultDataView data,
+                    std::unique_ptr<viz::CopyOutputResult>* out_p);
+diff --git a/services/viz/public/mojom/compositing/copy_output_request.mojom b/services/viz/public/mojom/compositing/copy_output_request.mojom
+--- a/services/viz/public/mojom/compositing/copy_output_request.mojom
++++ b/services/viz/public/mojom/compositing/copy_output_request.mojom
+@@ -26,8 +26,8 @@
+ 
+   bool is_secure;
+ 
+-  // Experiment: see CopyOutputRequest::wait_for_new_frame().
+-  bool wait_for_new_frame;
++  // Experiment: see CopyOutputRequest::wait_for_new_frame_key().
++  mojo_base.mojom.UnguessableToken? wait_for_new_frame_key;
+ 
+   pending_remote<CopyOutputResultSender> result_sender;
+ };
+diff --git a/services/viz/public/mojom/compositing/copy_output_result.mojom b/services/viz/public/mojom/compositing/copy_output_result.mojom
+--- a/services/viz/public/mojom/compositing/copy_output_result.mojom
++++ b/services/viz/public/mojom/compositing/copy_output_result.mojom
+@@ -5,6 +5,7 @@
+ module viz.mojom;
+ 
+ import "gpu/ipc/common/mailbox.mojom";
++import "gpu/ipc/common/sync_token.mojom";
+ import "services/viz/public/mojom/compositing/bitmap_in_shared_memory.mojom";
+ import "services/viz/public/mojom/compositing/tracked_element_rects.mojom";
+ import "services/viz/public/mojom/compositing/texture_releaser.mojom";
+@@ -53,4 +54,7 @@
+ 
+   // Error information for a result.
+   CopyOutputResultError error;
++
++  // Experiment: see CopyOutputResult::sync_token().
++  gpu.mojom.SyncToken sync_token;
+ };

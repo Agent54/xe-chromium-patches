@@ -1,0 +1,202 @@
+From 63b6e4fc7d655daf8651374454a4dbb2cd391daa Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 21:35:24 +0000
+Subject: [PATCH 3/50] RemoteFrameSurfaceIgnoresTransformedSize: no new child
+ surface for a transform-only change
+
+RemoteFrame::SynchronizeVisualProperties() previously allocated a new
+child LocalSurfaceId whenever rect_in_local_root.size() changed. Under a
+per-frame CSS transform (scale, rotation, or perspective), that forced a
+full VisualProperties round-trip and new surface submission on every
+frame even when the child's layout size (local_frame_size), compositing
+scale, and compositor viewport were unchanged.
+
+Guard rect_in_local_root.size() surface allocation behind
+kRemoteFrameSurfaceIgnoresTransformedSize (enabled by default as a kill
+switch). Adds TransformedRemoteFrameBrowserTest parameterized over both
+feature enabled and explicitly disabled states (bool). Experimental zoom
+parameters are added separately in patches/03-experimental/0048-*.
+---
+ .../site_per_process_hit_test_browsertest.cc  | 131 ++++++++++++++++++
+ .../blink/renderer/core/frame/remote_frame.cc |  21 ++-
+ 2 files changed, 150 insertions(+), 2 deletions(-)
+
+diff --git a/content/browser/site_per_process_hit_test_browsertest.cc b/content/browser/site_per_process_hit_test_browsertest.cc
+index 3c12207..f6f7aef 100644
+--- a/content/browser/site_per_process_hit_test_browsertest.cc
++++ b/content/browser/site_per_process_hit_test_browsertest.cc
+@@ -7998,4 +7998,135 @@ IN_PROC_BROWSER_TEST_F(SitePerProcessHitTestTrustedUserActivationTriggersTest,
+ }
+ #endif  // !BUILDFLAG(IS_MAC) && !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_IOS)
+ 
++
++// Verifies that a cross-process iframe whose CSS transform changes after
++// load (scale, rotation, moves, off-screen), with and without
++// RemoteFrameSurfaceIgnoresTransformedSize (no new child surface when only the
++// transformed bounding-box size changes). Input, IntersectionObserver, the
++// compositing scale (raster sharpness) and the child's screen rect must stay
++// correct either way.
++class TransformedRemoteFrameBrowserTest
++    : public SitePerProcessBrowserTestBase,
++      public ::testing::WithParamInterface<bool> {
++ public:
++  TransformedRemoteFrameBrowserTest() {
++    if (GetParam()) {
++      feature_list_.InitFromCommandLine(
++          "RemoteFrameSurfaceIgnoresTransformedSize", "");
++    } else {
++      feature_list_.InitFromCommandLine(
++          "", "RemoteFrameSurfaceIgnoresTransformedSize");
++    }
++  }
++
++ protected:
++  base::test::ScopedFeatureList feature_list_;
++};
++
++INSTANTIATE_TEST_SUITE_P(All, TransformedRemoteFrameBrowserTest,
++                         ::testing::Bool());
++
++IN_PROC_BROWSER_TEST_P(TransformedRemoteFrameBrowserTest,
++                       DynamicTransformKeepsInputScaleAndIntersection) {
++  GURL main_url(embedded_test_server()->GetURL(
++      "a.com", "/cross_site_iframe_factory.html?a(b)"));
++  ASSERT_TRUE(NavigateToURL(shell(), main_url));
++  FrameTreeNode* root = web_contents()->GetPrimaryFrameTree().root();
++  FrameTreeNode* child = root->child_at(0);
++  ASSERT_TRUE(child->current_frame_host()->IsCrossProcessSubframe());
++  ASSERT_TRUE(ExecJs(root, R"(
++    document.body.style.margin = '0';
++    const f = document.querySelector('iframe');
++    f.style.cssText = 'position:absolute;left:0;top:0;width:200px;' +
++        'height:200px;border:0;margin:0;transform-origin:0 0';)"));
++  ASSERT_TRUE(ExecJs(child, R"(
++    document.body.style.margin = '0';
++    document.body.innerHTML =
++        '<div id=t style="width:200px;height:200px;background:red"></div>';
++    window.clicks = [];
++    document.addEventListener('mousedown',
++        e => clicks.push([e.clientX, e.clientY]));
++    window.io = {intersecting: null, n: 0};
++    new IntersectionObserver(entries => {
++      for (const e of entries) { io.intersecting = e.isIntersecting; io.n++; }
++    }).observe(document.getElementById('t'));)"));
++  auto* child_rwh = static_cast<RenderWidgetHostImpl*>(
++      child->current_frame_host()->GetRenderWidgetHost());
++  auto set_transform = [&](const std::string& transform) {
++    return ExecJs(root, JsReplace(
++        "document.querySelector('iframe').style.transform = $1;", transform));
++  };
++  auto compositing_scale = [&]() {
++    auto props = child_rwh->LastComputedVisualProperties();
++    return props ? props->compositing_scale_factor : -1.f;
++  };
++  auto child_surface = [&]() {
++    auto props = child_rwh->LastComputedVisualProperties();
++    return props && props->local_surface_id ? *props->local_surface_id
++                                            : viz::LocalSurfaceId();
++  };
++  // Clicks at a root point until the child reports a click there (hit-test
++  // data follows the new transform within a few frames).
++  auto click_lands_at = [&](const gfx::Point& root_point, int x, int y) {
++    return base::test::RunUntil([&]() {
++      SimulateMouseClickAt(web_contents(), 0,
++                           blink::WebMouseEvent::Button::kLeft, root_point);
++      return EvalJs(child, JsReplace(R"(
++          clicks.length > 0 &&
++          Math.abs(clicks[clicks.length - 1][0] - $1) <= 3 &&
++          Math.abs(clicks[clicks.length - 1][1] - $2) <= 3)",
++                                     x, y))
++          .ExtractBool();
++    });
++  };
++  WaitForHitTestData(child->current_frame_host());
++
++  // 1. Scaled down: compositing scale follows; a click maps into the child.
++  ASSERT_TRUE(set_transform("translate(100px, 100px) scale(0.5)"));
++  EXPECT_TRUE(base::test::RunUntil([&]() { return compositing_scale() == .5f; }));
++  EXPECT_TRUE(click_lands_at(gfx::Point(150, 150), 100, 100));
++
++  // 2. Rotated (same scale, different bounding-box size): input still lands;
++  // with the feature the child keeps its surface.
++  const viz::LocalSurfaceId before_rotation = child_surface();
++  ASSERT_TRUE(set_transform(
++      "translate(150px, 150px) rotate(30deg) scale(0.5)"));
++  // Child point (100, 100) -> 150 + R30 * (50, 50) = (168.3, 218.3).
++  EXPECT_TRUE(click_lands_at(gfx::Point(168, 218), 100, 100));
++  EXPECT_EQ(compositing_scale(), .5f);
++  if (GetParam()) {
++    EXPECT_EQ(before_rotation, child_surface());
++  }
++
++  // 3. Moved: the child's screen rect follows.
++  ASSERT_TRUE(set_transform("translate(300px, 50px) scale(0.5)"));
++  RenderWidgetHostViewBase* root_view = static_cast<RenderWidgetHostViewBase*>(
++      root->current_frame_host()->GetView());
++  RenderWidgetHostViewBase* child_view = static_cast<RenderWidgetHostViewBase*>(
++      child->current_frame_host()->GetView());
++  EXPECT_TRUE(base::test::RunUntil([&]() {
++    gfx::Vector2d offset = child_view->GetViewBounds().origin() -
++                           root_view->GetViewBounds().origin();
++    return std::abs(offset.x() - 300) <= 1 && std::abs(offset.y() - 50) <= 1;
++  }));
++  EXPECT_TRUE(click_lands_at(gfx::Point(350, 100), 100, 100));
++
++  // 4. Moved off-screen, then back on-screen but scaled far down:
++  // IntersectionObserver in the child follows.
++  ASSERT_TRUE(set_transform("translate(-2000px, 0) scale(0.5)"));
++  EXPECT_TRUE(base::test::RunUntil([&]() {
++    return EvalJs(child, "io.intersecting === false").ExtractBool();
++  }));
++  ASSERT_TRUE(set_transform("translate(10px, 10px) scale(0.05)"));
++  EXPECT_TRUE(base::test::RunUntil([&]() {
++    return EvalJs(child, "io.intersecting === true").ExtractBool();
++  }));
++
++  // 5. Back to 1:1: the compositing scale (raster scale) returns to 1.
++  ASSERT_TRUE(set_transform("none"));
++  EXPECT_TRUE(
++      base::test::RunUntil([&]() { return compositing_scale() == 1.f; }));
++  EXPECT_TRUE(click_lands_at(gfx::Point(100, 100), 100, 100));
++}
++
+ }  // namespace content
+diff --git a/third_party/blink/renderer/core/frame/remote_frame.cc b/third_party/blink/renderer/core/frame/remote_frame.cc
+index 90726d2..5c51155 100644
+--- a/third_party/blink/renderer/core/frame/remote_frame.cc
++++ b/third_party/blink/renderer/core/frame/remote_frame.cc
+@@ -81,6 +81,12 @@
+ 
+ namespace blink {
+ 
++// See RemoteFrame::SynchronizeVisualProperties(). Enabled by default; the
++// feature remains as a kill switch.
++BASE_FEATURE(kRemoteFrameSurfaceIgnoresTransformedSize,
++             base::FEATURE_ENABLED_BY_DEFAULT);
++
++
+ namespace {
+ 
+ // Maintain a global (statically-allocated) hash map indexed by the the result
+@@ -1036,8 +1042,19 @@ bool RemoteFrame::SynchronizeVisualProperties(
+           pending_visual_properties_.max_size_for_auto_resize ||
+       sent_visual_properties_->local_frame_size !=
+           pending_visual_properties_.local_frame_size ||
+-      sent_visual_properties_->rect_in_local_root.size() !=
+-          pending_visual_properties_.rect_in_local_root.size() ||
++      // kRemoteFrameSurfaceIgnoresTransformedSize: the size of the frame's
++      // bounding box in the local root changes on every frame under a
++      // changing scale/rotation/perspective transform, while the child's
++      // layout size (local_frame_size), compositing scale and compositor
++      // viewport may not; only those determine the child's surface (its
++      // CompositorFrame size and raster scale). The transformed rect is still
++      // sent (rect_changed below) for the browser's view bounds and the
++      // child's screen rects; hit testing uses the embedder's quad
++      // transforms and viewport intersection has its own message.
++      (!base::FeatureList::IsEnabled(
++           kRemoteFrameSurfaceIgnoresTransformedSize) &&
++       sent_visual_properties_->rect_in_local_root.size() !=
++           pending_visual_properties_.rect_in_local_root.size()) ||
+       sent_visual_properties_->screen_infos !=
+           pending_visual_properties_.screen_infos ||
+       sent_visual_properties_->zoom_level !=

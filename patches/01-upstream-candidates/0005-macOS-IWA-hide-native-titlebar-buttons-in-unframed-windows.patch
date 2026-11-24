@@ -1,0 +1,314 @@
+From d42025414688ea84944f8502153c770196fb2018 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Wed, 23 Sep 2026 06:12:52 +0000
+Subject: [PATCH 5/50] macOS IWA: hide native titlebar buttons in unframed windows
+
+Unframed isolated web apps remove the web app toolbar, but macOS still
+creates a titled window in the remote Cocoa app shim. Its native close,
+minimize and zoom buttons remain visible over app content. Send the unframed
+state to the actual NSWindow, hide or restore its standard buttons, and
+remove the caption exclusion from the browser layout.
+
+Covers style-mask changes and permission grant/revoke transitions.
+Re-anchored against stock Chromium 160.0.8176.0 (zero downstream browser
+context dependencies).
+
+Bug: 482535474
+Test: BrowserNativeWidgetWindowTest.UnframedTitlebarButtons (remote_cocoa
+      unit test) and the unframed IWA browser test, re-anchored to Chromium
+      160 (pending compile/run verification on Chromium 160).
+---
+ .../ui/views/frame/browser_frame_view_mac.h   |  4 ++
+ .../ui/views/frame/browser_frame_view_mac.mm  | 15 +++++++
+ .../isolated_web_apps/unframed_browsertest.cc | 28 ++++++++++++
+ .../browser_native_widget_window_mac.h        |  4 ++
+ .../browser_native_widget_window_mac.mm       | 24 +++++++++-
+ ...wser_native_widget_window_mac_unittests.mm | 44 +++++++++++++++++++
+ .../app_shim/native_widget_ns_window_bridge.h |  1 +
+ .../native_widget_ns_window_bridge.mm         |  8 ++++
+ .../common/native_widget_ns_window.mojom      |  4 ++
+ 9 files changed, 131 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/ui/views/frame/browser_frame_view_mac.h b/chrome/browser/ui/views/frame/browser_frame_view_mac.h
+index 8965be9..d8ca6d7 100644
+--- a/chrome/browser/ui/views/frame/browser_frame_view_mac.h
++++ b/chrome/browser/ui/views/frame/browser_frame_view_mac.h
+@@ -8,6 +8,7 @@
+ #import <CoreGraphics/CGBase.h>
+ 
+ #include <memory>
++#include <optional>
+ 
+ #include "base/callback_list.h"
+ #include "base/gtest_prod_util.h"
+@@ -138,6 +139,9 @@ class BrowserFrameViewMac : public BrowserFrameView,
+   bool is_glass_frame_eligible_ = false;
+ 
+   base::CallbackListSubscription glass_frame_service_subscription_;
++
++  // Last state sent to the real NSWindow, which may live in an app shim.
++  std::optional<bool> titlebar_buttons_visible_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_FRAME_BROWSER_FRAME_VIEW_MAC_H_
+diff --git a/chrome/browser/ui/views/frame/browser_frame_view_mac.mm b/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
+index 0a99f10..87c433d 100644
+--- a/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
++++ b/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
+@@ -473,6 +473,10 @@ FullscreenToolbarStyle GetUserPreferredToolbarStyle(bool always_show) {
+ BrowserFrameViewMac::GetCaptionButtonBounds() const {
+   BoundsAndMargins result;
+ 
++  if (GetBrowserView()->IsUnframedModeEnabled()) {
++    return result;
++  }
++
+   // In popups, the titlebar is system-drawn and the caption buttons aren't part
+   // of the client area.
+   if (GetBrowserView()->browser()->GetType() ==
+@@ -531,6 +535,17 @@ FullscreenToolbarStyle GetUserPreferredToolbarStyle(bool always_show) {
+ }
+ 
+ void BrowserFrameViewMac::Layout(PassKey) {
++  if (GetBrowserView()->GetIsWebAppType()) {
++    const bool visible = !GetBrowserView()->IsUnframedModeEnabled();
++    if (titlebar_buttons_visible_ != visible && GetWidget()) {
++      auto* host = views::NativeWidgetMacNSWindowHost::GetFromNativeWindow(
++          GetWidget()->GetNativeWindow());
++      if (host && host->GetNSWindowMojo()) {
++        host->GetNSWindowMojo()->SetTitlebarButtonsVisible(visible);
++        titlebar_buttons_visible_ = visible;
++      }
++    }
++  }
+   if (GetBrowserView()->IsWindowControlsOverlayEnabled()) {
+     LayoutWindowControlsOverlay();
+   }
+diff --git a/chrome/browser/web_applications/isolated_web_apps/unframed_browsertest.cc b/chrome/browser/web_applications/isolated_web_apps/unframed_browsertest.cc
+index ded3f77..8ebcd4a 100644
+--- a/chrome/browser/web_applications/isolated_web_apps/unframed_browsertest.cc
++++ b/chrome/browser/web_applications/isolated_web_apps/unframed_browsertest.cc
+@@ -9,6 +9,7 @@
+ #include "base/check.h"
+ #include "base/check_deref.h"
+ #include "base/location.h"
++#include "build/build_config.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -40,6 +41,13 @@
+ #include "url/gurl.h"
+ #include "url/origin.h"
+ 
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/ui/views/frame/browser_frame_view.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/window/non_client_view.h"
++#endif
++
+ namespace web_app {
+ 
+ namespace {
+@@ -132,6 +140,17 @@ void SetContentSetting(
+                                      setting);
+ }
+ 
++#if BUILDFLAG(IS_MAC)
++bool HasCaptionButtonExclusion(BrowserWindowInterface& browser) {
++  auto* browser_view = BrowserView::GetBrowserViewForBrowser(&browser);
++  auto* frame_view = static_cast<BrowserFrameView*>(
++      browser_view->GetWidget()->non_client_view()->frame_view());
++  const auto params = frame_view->GetBrowserLayoutParams();
++  return !params.leading_exclusion.content.IsEmpty() ||
++         !params.trailing_exclusion.content.IsEmpty();
++}
++#endif
++
+ content::EvalJsResult WaitUntilCssDisplayModeIs(
+     BrowserWindowInterface& browser,
+     blink::mojom::DisplayMode mode) {
+@@ -271,18 +290,27 @@ IN_PROC_BROWSER_TEST_F(UnframedTest,
+       LaunchAppWithWindowOpenAndWait(kUnframedPagePath);
+   EXPECT_EQ(DisplayModeOf(browser), blink::mojom::DisplayMode::kUnframed);
+   EXPECT_EQ(ReadAppMessage(browser), kUnframedMessage);
++#if BUILDFLAG(IS_MAC)
++  EXPECT_FALSE(HasCaptionButtonExclusion(browser));
++#endif
+ 
+   SetAppWindowManagementPermission(CONTENT_SETTING_BLOCK);
+   EXPECT_EQ(true, WaitUntilCssDisplayModeIs(
+                       browser, blink::mojom::DisplayMode::kStandalone));
+   EXPECT_EQ(DisplayModeOf(browser), blink::mojom::DisplayMode::kStandalone);
+   EXPECT_EQ(ReadAppMessage(browser), kNotUnframedMessage);
++#if BUILDFLAG(IS_MAC)
++  EXPECT_TRUE(HasCaptionButtonExclusion(browser));
++#endif
+ 
+   SetAppWindowManagementPermission(CONTENT_SETTING_ALLOW);
+   EXPECT_EQ(true, WaitUntilCssDisplayModeIs(
+                       browser, blink::mojom::DisplayMode::kUnframed));
+   EXPECT_EQ(DisplayModeOf(browser), blink::mojom::DisplayMode::kUnframed);
+   EXPECT_EQ(ReadAppMessage(browser), kUnframedMessage);
++#if BUILDFLAG(IS_MAC)
++  EXPECT_FALSE(HasCaptionButtonExclusion(browser));
++#endif
+ }
+ 
+ }  // namespace web_app
+diff --git a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
+index 48fec9d..140c5ac 100644
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
+@@ -12,6 +12,10 @@ REMOTE_COCOA_APP_SHIM_EXPORT
+ // When set to `YES`, the traffic lights will always be shown. When set to `NO`,
+ // the traffic lights follow the default AppKit behavior.
+ - (void)setAlwaysShowTrafficLights:(BOOL)alwaysShow;
++
++// Hide the native controls while an isolated web app is unframed, without
++// changing the window's close or resize capabilities.
++- (void)setTitlebarButtonsVisible:(BOOL)visible;
+ // A controller that keeps a small portion (0.5px) of the fullscreen AppKit
+ // NSWindow on screen.
+ // This controller is used as a workaround for an AppKit bug
+diff --git a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
+index ae93fe9..48b01dc 100644
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
+@@ -144,7 +144,9 @@ - (void)maybeShowTrafficLights {
+ 
+ @end
+ 
+-@implementation BrowserNativeWidgetWindow
++@implementation BrowserNativeWidgetWindow {
++  BOOL _titlebarButtonsHidden;
++}
+ 
+ @synthesize thinTitlebarViewController = _thinTitlebarViewController;
+ 
+@@ -220,4 +222,24 @@ - (void)setAlwaysShowTrafficLights:(BOOL)alwaysShow {
+       setAlwaysShowTrafficLights:alwaysShow];
+ }
+ 
++- (void)setTitlebarButtonsVisible:(BOOL)visible {
++  _titlebarButtonsHidden = !visible;
++  [self updateTitlebarButtonsVisibility];
++}
++
++// AppKit may replace the standard buttons when the window style changes.
++- (void)updateTitlebarButtonsVisibility {
++  for (NSWindowButton type :
++       {NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton}) {
++    [self standardWindowButton:type].hidden = _titlebarButtonsHidden;
++  }
++}
++
++- (void)setStyleMask:(NSUInteger)styleMask {
++  [super setStyleMask:styleMask];
++  if (_titlebarButtonsHidden) {
++    [self updateTitlebarButtonsVisibility];
++  }
++}
++
+ @end
+diff --git a/components/remote_cocoa/app_shim/browser_native_widget_window_mac_unittests.mm b/components/remote_cocoa/app_shim/browser_native_widget_window_mac_unittests.mm
+index 9408b15..91e7db6 100644
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac_unittests.mm
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac_unittests.mm
+@@ -101,6 +101,50 @@ - (void)setButtonRevealAmount:(double)amount;
+   EXPECT_EQ(theme_frame.zoomButton.alphaValue, 0.0);
+ }
+ 
++TEST(BrowserNativeWidgetWindowTest, UnframedTitlebarButtons) {
++  BrowserNativeWidgetWindow* browser_window = [[BrowserNativeWidgetWindow alloc]
++      initWithContentRect:NSMakeRect(0, 0, 600, 400)
++                styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
++                          NSWindowStyleMaskMiniaturizable |
++                          NSWindowStyleMaskResizable
++                  backing:NSBackingStoreBuffered
++                    defer:NO];
++
++  const NSWindowButton buttons[] = {
++      NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton};
++  constexpr NSWindowStyleMask kCapabilityMask =
++      NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |
++      NSWindowStyleMaskResizable;
++  const NSWindowStyleMask capabilities =
++      browser_window.styleMask & kCapabilityMask;
++  for (NSWindowButton type : buttons) {
++    ASSERT_NE([browser_window standardWindowButton:type], nil);
++    EXPECT_FALSE([browser_window standardWindowButton:type].hidden);
++  }
++
++  [browser_window setTitlebarButtonsVisible:NO];
++  EXPECT_EQ(browser_window.styleMask & kCapabilityMask, capabilities);
++  for (NSWindowButton type : buttons) {
++    EXPECT_TRUE([browser_window standardWindowButton:type].hidden);
++  }
++
++  // AppKit may recreate buttons when the window's resize capability changes.
++  [browser_window
++      setStyleMask:browser_window.styleMask & ~NSWindowStyleMaskResizable];
++  [browser_window
++      setStyleMask:browser_window.styleMask | NSWindowStyleMaskResizable];
++  [browser_window setFrame:NSMakeRect(0, 0, 500, 300) display:NO];
++  EXPECT_EQ(browser_window.styleMask & kCapabilityMask, capabilities);
++  for (NSWindowButton type : buttons) {
++    EXPECT_TRUE([browser_window standardWindowButton:type].hidden);
++  }
++
++  [browser_window setTitlebarButtonsVisible:YES];
++  for (NSWindowButton type : buttons) {
++    EXPECT_FALSE([browser_window standardWindowButton:type].hidden);
++  }
++}
++
+ // Test that a window with enforceNeverMadeVisible cannot be ordered in.
+ // This prevents external frameworks (e.g., AuthenticationServicesCore)
+ // from making the invisible proxy window visible as a side effect of
+diff --git a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.h b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.h
+index 2daccc6..e825ba5 100644
+--- a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.h
++++ b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.h
+@@ -319,6 +319,7 @@ class REMOTE_COCOA_APP_SHIM_EXPORT NativeWidgetNSWindowBridge
+                           const gfx::Size& max_size,
+                           bool is_resizable,
+                           bool is_maximizable) override;
++  void SetTitlebarButtonsVisible(bool visible) override;
+   void SetOpacity(float opacity) override;
+   void SetWindowLevel(int32_t level) override;
+   void SetActivationIndependence(bool independence) override;
+diff --git a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
+index 9fbf2b6..cdbedae 100644
+--- a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
++++ b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
+@@ -1627,6 +1627,14 @@ NSUInteger CountBridgedWindows(NSArray* child_windows) {
+                                     shows_fullscreen_controls);
+ }
+ 
++void NativeWidgetNSWindowBridge::SetTitlebarButtonsVisible(bool visible) {
++  BrowserNativeWidgetWindow* browser_window =
++      base::apple::ObjCCast<BrowserNativeWidgetWindow>(window_);
++  if (browser_window) {
++    [browser_window setTitlebarButtonsVisible:visible];
++  }
++}
++
+ void NativeWidgetNSWindowBridge::OnShowAnimationComplete() {
+   show_animation_ = nil;
+ }
+diff --git a/components/remote_cocoa/common/native_widget_ns_window.mojom b/components/remote_cocoa/common/native_widget_ns_window.mojom
+index a222d5e..5d7258d 100644
+--- a/components/remote_cocoa/common/native_widget_ns_window.mojom
++++ b/components/remote_cocoa/common/native_widget_ns_window.mojom
+@@ -238,6 +238,10 @@ interface NativeWidgetNSWindow {
+                      bool is_resizable,
+                      bool is_maximizable);
+ 
++  // Show or hide the native close, minimize, and zoom buttons. Unframed web
++  // apps still need a resizable window, but must not expose titlebar controls.
++  SetTitlebarButtonsVisible(bool visible);
++
+   // Set the opacity of the NSWindow.
+   SetOpacity(float opacity);
+ 

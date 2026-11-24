@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 20:18:03 +0000
+Subject: [PATCH 30/50] direct route: null-check teardown paths, validate Reallocate() and sync token release
+
+- Teardown: GuestFrameTextureSourceHostImpl no longer dereferences a missing
+  HostFrameSinkManager, SharedImageInterface or RasterInterface (browser
+  shutdown, lost context). A lost or missing raster interface counts as lost.
+- Reallocate() is callable by the renderer at any time. It now requires that
+  the context was lost, that no copy is in flight and that the guest may
+  still be read (the same ownership and policy check as every copy), so live
+  images are never replaced without a destruction sync token.
+- SkiaOutputSurfaceImpl::FlushGpuTasksWithImpl() only drops the pending copy
+  release token when release_in has the same namespace and command buffer and
+  a release count that is not lower; otherwise the token is kept for the next
+  flush instead of never being released.
+- MayReadGuestFramePixels() returns false without a Profile or its prefs.
+---
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -10141,6 +10141,9 @@
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   Profile* profile =
+       Profile::FromBrowserContext(guest_contents->GetBrowserContext());
++  if (!profile || !profile->GetPrefs()) {
++    return false;
++  }
+   if (!profile->GetUserData(&kGuestFramePixelsPolicyWatcherKey)) {
+     profile->SetUserData(
+         &kGuestFramePixelsPolicyWatcherKey,
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+@@ -1428,8 +1428,19 @@
+   if (pending_copy_release_token_.HasData()) {
+     if (!release.HasData()) {
+       release = pending_copy_release_token_;
++      pending_copy_release_token_.Clear();
++    } else if (release.namespace_id() ==
++                   pending_copy_release_token_.namespace_id() &&
++               release.command_buffer_id() ==
++                   pending_copy_release_token_.command_buffer_id() &&
++               release.release_count() >=
++                   pending_copy_release_token_.release_count()) {
++      // Release counts on a sequence are monotonic, so a `release_in` of the
++      // same sequence that is not older also releases the pending token.
++      pending_copy_release_token_.Clear();
+     }
+-    pending_copy_release_token_.Clear();
++    // Otherwise `release_in` does not cover the pending token: keep it for
++    // the next flush instead of dropping it unreleased.
+   }
+ 
+   // impl_on_gpu will only be null during initialization. If we need to make
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+--- a/content/browser/renderer_host/guest_frame_texture_host.cc
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -226,12 +226,18 @@
+     CancelPendingCopies();
+     cap_interval_ = base::TimeDelta();
+     SetGuestInterval(base::TimeDelta());
+-    // The renderer holds its own imported references; ours go away here.
+-    gpu::SyncToken token = context_provider_->SharedImageInterface()
+-                               ->GenUnverifiedSyncToken();
++    // The renderer holds its own imported references; ours go away here. The
++    // shared image interface can already be gone during shutdown.
++    gpu::SharedImageInterface* sii =
++        context_provider_ ? context_provider_->SharedImageInterface()
++                          : nullptr;
++    const gpu::SyncToken token =
++        sii ? sii->GenUnverifiedSyncToken() : gpu::SyncToken();
+     for (auto& image : images_) {
+       if (image) {
+-        image->UpdateDestructionSyncToken(token);
++        if (sii) {
++          image->UpdateDestructionSyncToken(token);
++        }
+         account_->RemoveBytes(ImageBytes(size_));
+       }
+     }
+@@ -259,11 +265,20 @@
+   // After the GPU context (and so the images) was lost: a new ring of the
+   // same size on the current context. Slots the renderer gave up stay empty.
+   void Reallocate(ReallocateCallback callback) override {
++    // Callable by the renderer at any time: only valid after the context was
++    // lost (otherwise live images would be replaced without a destruction
++    // sync token), with no copy in flight, and only while the guest may still
++    // be read (the ownership and policy check of every copy).
++    if (stopped_ || std::ranges::count(in_flight_, true) > 0 ||
++        !(images_lost_ || IsLost(context_provider_.get())) || !FindView()) {
++      std::move(callback).Run({}, gpu::SyncToken());
++      return;
++    }
+     scoped_refptr<viz::RasterContextProvider> provider =
+         GetBrowserContextProvider();
+     gpu::SharedImageInterface* sii =
+         provider ? provider->SharedImageInterface() : nullptr;
+-    if (stopped_ || !sii || IsLost(provider.get())) {
++    if (!sii || IsLost(provider.get())) {
+       std::move(callback).Run({}, gpu::SyncToken());
+       return;
+     }
+@@ -385,9 +400,11 @@
+   // Copies requested from viz and not yet taken for drawing are dropped (they
+   // complete with an empty result), and viz forgets this source's key.
+   void CancelPendingCopies() {
+-    for (const viz::FrameSinkId& sink : requested_sinks_) {
+-      GetHostFrameSinkManager()->CancelKeyedCopyOutputRequests(sink,
+-                                                               wait_key_);
++    // The manager is gone during shutdown; its requests went with it.
++    if (auto* manager = GetHostFrameSinkManager()) {
++      for (const viz::FrameSinkId& sink : requested_sinks_) {
++        manager->CancelKeyedCopyOutputRequests(sink, wait_key_);
++      }
+     }
+     requested_sinks_.clear();
+   }
+@@ -428,6 +445,10 @@
+       return;
+     }
+     waits_[index] = 0;
++    if (!GetHostFrameSinkManager()) {
++      Reply(index, std::move(callback), Status::kEnded, gpu::SyncToken());
++      return;
++    }
+     auto request = std::make_unique<viz::CopyOutputRequest>(
+         viz::CopyOutputRequest::ResultFormat::RGBA,
+         viz::CopyOutputRequest::ResultDestination::kSharedImage,
+@@ -454,6 +475,10 @@
+   }
+ 
+   static bool IsLost(viz::RasterContextProvider* provider) {
++    // No provider or raster interface (shutdown) counts as lost.
++    if (!provider || !provider->RasterInterface()) {
++      return true;
++    }
+     return provider->RasterInterface()->GetGraphicsResetStatusKHR() !=
+            GL_NO_ERROR;
+   }

@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 08:54:30 +0000
+Subject: [PATCH 1/50] controlledframe/guest view: keep guest across moveBefore() (connectedMoveCallback)
+
+Moving a <webview>, <controlledframe> or <extensionoptions> element, or one
+of its ancestors, with Node.moveBefore() disconnects and reconnects it
+without destroying it. The guest view container element used to treat the
+reconnect like a new attach and created a second guest. Handle
+connectedMoveCallback so that the element stays bound to its existing guest;
+removing the element still destroys the guest.
+
+Tests: WebViewTest.Shim_TestMoveBeforeKeepsGuest,
+ControlledFrameMoveBeforeTest.MoveBeforeKeepsGuest and a matching
+ExtensionWebUIEmbeddedOptionsTest case.
+---
+diff --git a/chrome/browser/apps/guest_view/web_view_browsertest.cc b/chrome/browser/apps/guest_view/web_view_browsertest.cc
+--- a/chrome/browser/apps/guest_view/web_view_browsertest.cc
++++ b/chrome/browser/apps/guest_view/web_view_browsertest.cc
+@@ -2461,6 +2461,22 @@
+   GetGuestViewManager()->WaitForLastGuestDeleted();
+ }
+ 
++// Moving a <webview>, or one of its ancestors, with Node.moveBefore() must keep
++// the element bound to its existing guest. It must not create a second guest,
++// and removing the element must still destroy the guest.
++IN_PROC_BROWSER_TEST_P(WebViewTest, Shim_TestMoveBeforeKeepsGuest) {
++  ASSERT_NO_FATAL_FAILURE(
++      TestHelper("testMoveBeforeKeepsGuest", "web_view/shim", NO_TEST_SERVER));
++  ASSERT_EQ(1u, GetGuestViewManager()->num_guests_created());
++  ASSERT_EQ(1u, GetGuestViewManager()->GetCurrentGuestCount());
++
++  // Exactly one guest exists here, so waiting for all guests waits for it.
++  ASSERT_TRUE(content::ExecJs(GetFirstAppWindowWebContents(),
++                              "document.querySelector('webview').remove();"));
++  GetGuestViewManager()->WaitForAllGuestsDeleted();
++  EXPECT_EQ(0u, GetGuestViewManager()->GetCurrentGuestCount());
++}
++
+ // Remove <webview> immediately after navigating it.
+ // This is a regression test for http://crbug.com/40077958.
+ IN_PROC_BROWSER_TEST_P(WebViewTest, Shim_TestRemoveWebviewAfterNavigation) {
+diff --git a/chrome/browser/controlled_frame/controlled_frame_apitest.cc b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+--- a/chrome/browser/controlled_frame/controlled_frame_apitest.cc
++++ b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+@@ -8,6 +8,7 @@
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
++#include "base/memory/raw_ptr.h"
+ #include "base/path_service.h"
+ #include "base/task/current_thread.h"
+ #include "base/test/bind.h"
+@@ -29,6 +30,8 @@
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+ #include "components/content_settings/core/common/content_settings.h"
+ #include "components/embedder_support/user_agent_utils.h"
++#include "components/guest_view/browser/guest_view_manager_delegate.h"
++#include "components/guest_view/browser/test_guest_view_manager.h"
+ #include "components/policy/core/common/policy_pref_names.h"
+ #include "components/prefs/pref_service.h"
+ #include "content/public/browser/render_frame_host.h"
+@@ -44,6 +47,7 @@
+ #include "content/public/test/test_navigation_observer.h"
+ #include "content/public/test/test_utils.h"
+ #include "content/public/test/web_transport_simple_test_server.h"
++#include "extensions/browser/api/extensions_api_client.h"
+ #include "extensions/browser/api/web_request/extension_web_request_event_router.h"
+ #include "extensions/browser/background_script_executor.h"
+ #include "extensions/browser/event_router.h"
+@@ -492,4 +496,123 @@
+   EXPECT_EQ(kEvalSuccessStr, VerifyBackgroundColorIsRed(web_view_guest));
++}
++
++class ControlledFrameMoveBeforeTest : public ControlledFrameApiTest {
++ public:
++  void SetUpOnMainThread() override {
++    ControlledFrameApiTest::SetUpOnMainThread();
++    guest_view_manager_ = factory_.GetOrCreateTestGuestViewManager(
++        profile(), extensions::ExtensionsAPIClient::Get()
++                       ->CreateGuestViewManagerDelegate());
++  }
++
++  void TearDownOnMainThread() override {
++    guest_view_manager_ = nullptr;
++    ControlledFrameApiTest::TearDownOnMainThread();
++  }
++
++ protected:
++  guest_view::TestGuestViewManager* guest_view_manager() {
++    return guest_view_manager_;
++  }
++
++ private:
++  guest_view::TestGuestViewManagerFactory factory_;
++  raw_ptr<guest_view::TestGuestViewManager> guest_view_manager_ = nullptr;
++};
++
++// Moving a <controlledframe>, or one of its ancestors, with Node.moveBefore()
++// must keep the element bound to its existing guest. It must not create a
++// second guest or rebind the element's API to one.
++IN_PROC_BROWSER_TEST_F(ControlledFrameMoveBeforeTest, MoveBeforeKeepsGuest) {
++  std::unique_ptr<web_app::ScopedBundledIsolatedWebApp> app =
++      web_app::IsolatedWebAppBuilder(
++          web_app::ManifestBuilder().AddPermissionsPolicy(
++              network::mojom::PermissionsPolicyFeature::kControlledFrame,
++              /*self=*/true,
++              /*origins=*/{}))
++          .BuildBundle();
++  app->TrustSigningKey();
++  ASSERT_OK_AND_ASSIGN(web_app::IsolatedWebAppUrlInfo url_info,
++                       app->Install(profile()));
++  content::RenderFrameHost* app_frame = OpenApp(url_info.app_id());
++
++  ASSERT_TRUE(CreateControlledFrame(
++      app_frame, embedded_https_test_server().GetURL("/index.html")));
++  extensions::WebViewGuest* original_guest = GetWebViewGuest(app_frame);
++  ASSERT_TRUE(original_guest);
++  ASSERT_EQ(1u, guest_view_manager()->num_guests_created());
++  const int original_guest_instance_id = original_guest->guest_instance_id();
++
++  // Mark the original guest's document. ExecJs() runs in the guest's main
++  // world and executeScript() in an isolated world, so the marker is kept in
++  // the DOM, which both worlds share.
++  ASSERT_TRUE(content::ExecJs(
++      original_guest->GetGuestMainFrame(),
++      "document.documentElement.setAttribute('data-marker', 'original');"));
++  ASSERT_TRUE(content::ExecJs(app_frame, R"(
++    window.readMarker = async function() {
++      const frame = document.getElementsByTagName('controlledframe')[0];
++      try {
++        const [marker] = await frame.executeScript({
++          code: 'document.documentElement.getAttribute("data-marker")'
++        });
++        return String(marker);
++      } catch (e) {
++        return 'error: ' + e;
++      }
++    };
++  )"));
++  // The element's API reaches the marked document before any move.
++  ASSERT_EQ("original", content::EvalJs(app_frame, "readMarker()"));
++
++  // Move the element within its parent, to another parent, and move one of
++  // its ancestors. After each move, the element must keep its contentWindow
++  // and its API must still reach the marked document. If a move rebinds the
++  // element, the element drops its guest synchronously within moveBefore(), so
++  // the contentWindow check fails without waiting on a script call that would
++  // never complete.
++  ASSERT_EQ("original,original,original", content::EvalJs(app_frame, R"(
++    (async function() {
++      const frame = document.getElementsByTagName('controlledframe')[0];
++      const originalWindow = frame.contentWindow;
++      const container = document.createElement('div');
++      const otherContainer = document.createElement('div');
++      document.body.append(container, otherContainer);
++      const moves = [
++        () => frame.parentNode.moveBefore(frame, null),
++        () => container.moveBefore(frame, null),
++        () => otherContainer.moveBefore(container, null),
++      ];
++      const markers = [];
++      for (const move of moves) {
++        move();
++        if (frame.contentWindow !== originalWindow) {
++          markers.push('contentWindow changed');
++          break;
++        }
++        markers.push(await readMarker());
++      }
++      return markers.join();
++    })();
++  )"));
++
++  // No other guest was created, and the original guest is still the attached
++  // guest of the element. `original_guest` is not used after the moves: if
++  // the moves destroyed or replaced it, the pointer would be stale.
++  ASSERT_EQ(1u, guest_view_manager()->num_guests_created());
++  ASSERT_EQ(1u, guest_view_manager()->GetCurrentGuestCount());
++  extensions::WebViewGuest* current_guest = GetWebViewGuest(app_frame);
++  ASSERT_TRUE(current_guest);
++  ASSERT_EQ(original_guest_instance_id, current_guest->guest_instance_id());
++  EXPECT_TRUE(current_guest->attached());
++
++  // Removing the element still destroys the guest. Exactly one guest exists
++  // here, so waiting for all guests waits for this one.
++  ASSERT_TRUE(content::ExecJs(
++      app_frame,
++      "document.getElementsByTagName('controlledframe')[0].remove();"));
++  guest_view_manager()->WaitForAllGuestsDeleted();
++  EXPECT_EQ(0u, guest_view_manager()->GetCurrentGuestCount());
+ }
+ 
+ IN_PROC_BROWSER_TEST_F(ControlledFrameApiTest,
+diff --git a/chrome/browser/extensions/extension_webui_apitest.cc b/chrome/browser/extensions/extension_webui_apitest.cc
+--- a/chrome/browser/extensions/extension_webui_apitest.cc
++++ b/chrome/browser/extensions/extension_webui_apitest.cc
+@@ -22,6 +22,7 @@
+ #include "components/guest_view/browser/guest_view_manager_delegate.h"
+ #include "components/guest_view/browser/test_guest_view_manager.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/content_features.h"
+ #include "content/public/test/browser_test.h"
+@@ -121,6 +122,10 @@
+   }
+ 
+  protected:
++  guest_view::TestGuestViewManager* guest_view_manager() {
++    return test_guest_view_manager_;
++  }
++
+   // Loads |extension|'s options page in an <extensionoptions> and returns the
+   // <extensionoptions>'s main RenderFrameHost.
+   content::RenderFrameHost* OpenExtensionOptions(const Extension* extension) {
+@@ -338,4 +343,56 @@
+             browser()->GetTabStripModel()->GetIndexOfWebContents(new_contents));
++}
++
++// Moving an <extensionoptions>, or one of its ancestors, with Node.moveBefore()
++// must keep the element bound to its existing guest and must not create a
++// second guest.
++IN_PROC_BROWSER_TEST_P(ExtensionWebUIEmbeddedOptionsTest,
++                       MoveBeforeKeepsGuest) {
++  const Extension* extension =
++      LoadExtension(test_data_dir_.AppendASCII("extension_options")
++                        .AppendASCII("extension_with_options_page"));
++  ASSERT_TRUE(extension);
++  ASSERT_TRUE(OpenExtensionOptions(extension));
++  ASSERT_EQ(1u, guest_view_manager()->num_guests_created());
++  const int guest_instance_id =
++      guest_view_manager()->GetLastGuestViewCreated()->guest_instance_id();
++
++  content::WebContents* webui = GetActiveWebContents();
++  ASSERT_TRUE(content::ExecJs(webui, R"(
++    (() => {
++      const options = document.querySelector('extensionoptions');
++      const container = document.createElement('div');
++      const otherContainer = document.createElement('div');
++      document.body.append(container, otherContainer);
++      options.parentNode.moveBefore(options, null);
++      container.moveBefore(options, null);
++      otherContainer.moveBefore(container, null);
++    })();
++  )"));
++
++  // Embed a second <extensionoptions> and wait until it has loaded. The
++  // embedder requests its guests in order, so a guest requested by the moves
++  // would already exist by then.
++  static constexpr char kEmbedProbe[] = R"(
++    new Promise((resolve) => {
++      const probe = document.createElement('extensionoptions');
++      probe.extension = $1;
++      probe.addEventListener('load', () => resolve(), {once: true});
++      document.body.appendChild(probe);
++    });
++  )";
++  ASSERT_TRUE(
++      content::ExecJs(webui, content::JsReplace(kEmbedProbe, extension->id())));
++  EXPECT_EQ(2u, guest_view_manager()->num_guests_created());
++  EXPECT_EQ(2u, guest_view_manager()->GetCurrentGuestCount());
++
++  // The moved element's guest still exists and is still attached.
++  guest_view::GuestViewBase* guest =
++      guest_view_manager()->GetGuestByInstanceIDSafely(
++          guest_instance_id,
++          webui->GetPrimaryMainFrame()->GetProcess()->GetID());
++  ASSERT_TRUE(guest);
++  EXPECT_TRUE(guest->attached());
+ }
+ 
+ IN_PROC_BROWSER_TEST_P(ExtensionWebUIEmbeddedOptionsTest,
+diff --git a/chrome/test/data/extensions/platform_apps/web_view/shim/main.js b/chrome/test/data/extensions/platform_apps/web_view/shim/main.js
+--- a/chrome/test/data/extensions/platform_apps/web_view/shim/main.js
++++ b/chrome/test/data/extensions/platform_apps/web_view/shim/main.js
+@@ -4098,6 +4098,54 @@
+   embedder.test.succeed();
+ }
+ 
++// Moving a <webview>, or one of its ancestors, with Node.moveBefore() must
++// keep the element bound to its existing guest. If a move rebinds the element,
++// the element drops its guest synchronously within moveBefore(), so the
++// contentWindow check fails without waiting on a script call that would never
++// complete. The browser side checks the guest count.
++async function testMoveBeforeKeepsGuest() {
++  const webview = document.createElement('webview');
++  webview.setAttribute('partition', 'testMoveBeforeKeepsGuest');
++  const container = document.createElement('div');
++  const otherContainer = document.createElement('div');
++  document.body.append(container, otherContainer);
++  const loaded = new Promise((resolve) => {
++    webview.addEventListener('loadstop', resolve, {once: true});
++  });
++  webview.setAttribute('src', 'data:text/html,<body>guest</body>');
++  container.appendChild(webview);
++  await loaded;
++
++  // Mark the guest's document. executeScript() runs in an isolated world, so
++  // the marker is kept in the DOM, which all worlds share.
++  await executeScriptP(webview, {
++    code: 'document.documentElement.setAttribute("data-marker", "original");'
++  });
++  const originalWindow = webview.contentWindow;
++  const moves = [
++    () => container.moveBefore(webview, null),
++    () => otherContainer.moveBefore(webview, null),
++    () => container.moveBefore(otherContainer, null),
++  ];
++  for (const move of moves) {
++    move();
++    if (webview.contentWindow !== originalWindow) {
++      console.log('contentWindow changed after moveBefore()');
++      embedder.test.fail();
++      return;
++    }
++    const results = await executeScriptP(webview, {
++      code: 'document.documentElement.getAttribute("data-marker");'
++    });
++    if (!results || results[0] !== 'original') {
++      console.log('unexpected marker: ' + JSON.stringify(results));
++      embedder.test.fail();
++      return;
++    }
++  }
++  embedder.test.succeed();
++}
++
+ embedder.test.testList = {
+   'testAllowTransparencyAttribute': testAllowTransparencyAttribute,
+   // The final width depends on whether the scrollbar consumes layout space.
+@@ -4252,6 +4300,7 @@
+   'testPictureInPictureRequestWindow': testPictureInPictureRequestWindow,
+   'testWebRequestOnErrorOccurredNavigation':
+       testWebRequestOnErrorOccurredNavigation,
++  'testMoveBeforeKeepsGuest': testMoveBeforeKeepsGuest,
+ };
+ 
+ onload = function() {
+diff --git a/extensions/renderer/resources/guest_view/guest_view_container_element.js b/extensions/renderer/resources/guest_view/guest_view_container_element.js
+--- a/extensions/renderer/resources/guest_view/guest_view_container_element.js
++++ b/extensions/renderer/resources/guest_view/guest_view_container_element.js
+@@ -51,7 +51,13 @@
+     internal.internalInstanceId = 0;
+     internal.guest.destroy();
+     internal.onElementDetached();
+-  }
++  },
++
++  // An atomic move (Node.moveBefore()) of the element or of an ancestor
++  // preserves the internal iframe and its guest binding, so there is nothing
++  // to do. Without this callback, Blink would run disconnectedCallback and
++  // connectedCallback for the move instead.
++  connectedMoveCallback: function() {}
+ };
+ 
+ // Registers the guestview as a custom element.
+@@ -67,6 +73,8 @@
+         customElementCallbacks.disconnectedCallback;
+     GuestViewContainerElement.prototype.attributeChangedCallback =
+         customElementCallbacks.attributeChangedCallback;
++    GuestViewContainerElement.prototype.connectedMoveCallback =
++        customElementCallbacks.connectedMoveCallback;
+ 
+     $CustomElementRegistry.define(
+         window.customElements, $String.toLowerCase(elementName),
+@@ -78,6 +86,7 @@
+     delete GuestViewContainerElement.prototype.connectedCallback;
+     delete GuestViewContainerElement.prototype.disconnectedCallback;
+     delete GuestViewContainerElement.prototype.attributeChangedCallback;
++    delete GuestViewContainerElement.prototype.connectedMoveCallback;
+ 
+     // Now that |observedAttributes| has been retrieved, we can hide it from
+     // user code as well.

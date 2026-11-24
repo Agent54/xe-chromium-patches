@@ -1,0 +1,490 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 09:33:53 +0000
+Subject: [PATCH 6/50] controlledframe: prototype captureStream() for the guest
+
+Adds webViewInternal.getCaptureStreamId(), which registers a one-shot
+DesktopStreamsRegistry id (TYPE_WEB_CONTENTS of the guest) bound to the
+owning embedder's main frame and origin, and
+HTMLControlledFrameElement.captureStream(), which turns it into a
+MediaStream via getUserMedia({chromeMediaSource: 'desktop'}).
+Experiment.
+---
+diff --git a/chrome/browser/controlled_frame/controlled_frame_apitest.cc b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+--- a/chrome/browser/controlled_frame/controlled_frame_apitest.cc
++++ b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/browser/web_applications/isolated_web_apps/test/isolated_web_app_builder.h"
+ #include "chrome/common/chrome_features.h"
+ #include "chrome/common/chrome_paths.h"
++#include "chrome/test/base/ui_test_utils.h"
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+ #include "components/content_settings/core/common/content_settings.h"
+ #include "components/embedder_support/user_agent_utils.h"
+@@ -35,6 +36,7 @@
+ #include "components/policy/core/common/policy_pref_names.h"
+ #include "components/prefs/pref_service.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
+ #include "content/public/browser/service_worker_context.h"
+ #include "content/public/browser/service_worker_running_info.h"
+@@ -44,11 +46,14 @@
+ #include "content/public/common/content_features.h"
+ #include "content/public/test/browser_test.h"
+ #include "content/public/test/browser_test_utils.h"
++#include "content/public/test/no_renderer_crashes_assertion.h"
+ #include "content/public/test/test_navigation_observer.h"
+ #include "content/public/test/test_utils.h"
+ #include "content/public/test/web_transport_simple_test_server.h"
+ #include "extensions/browser/api/extensions_api_client.h"
++#include "extensions/browser/api/guest_view/web_view/web_view_internal_api.h"
+ #include "extensions/browser/api/web_request/extension_web_request_event_router.h"
++#include "extensions/browser/api_test_utils.h"
+ #include "extensions/browser/background_script_executor.h"
+ #include "extensions/browser/event_router.h"
+ #include "extensions/browser/guest_view/web_view/web_view_guest.h"
+@@ -654,4 +659,220 @@
+             content::EvalJs(app_frame, script));
++}
++
++// Uses the test guest view manager to wait for guest destruction.
++class ControlledFrameCaptureStreamTest : public ControlledFrameMoveBeforeTest {
++ public:
++  void SetUp() override {
++    // Browser tests draw nothing unless pixel output is enabled.
++    EnablePixelOutput();
++    ControlledFrameMoveBeforeTest::SetUp();
++  }
++};
++
++// captureStream() returns a live video track of the guest, the stream id it
++// uses can only be used once and only by the embedder that owns the guest,
++// and the track ends when the element (and so the guest) is removed.
++IN_PROC_BROWSER_TEST_F(ControlledFrameCaptureStreamTest, CaptureStream) {
++  web_app::IsolatedWebAppUrlInfo url_info =
++      CreateAndInstallEmptyApp(web_app::ManifestBuilder());
++  content::RenderFrameHost* app_frame = OpenApp(url_info.app_id());
++  ASSERT_TRUE(CreateControlledFrame(
++      app_frame, embedded_https_test_server().GetURL("/index.html")));
++  extensions::WebViewGuest* guest = GetWebViewGuest(app_frame);
++  ASSERT_TRUE(guest);
++
++  // Give the element a known size inside the (small) app viewport: only the
++  // part of the guest that is on screen is drawn, and so captured.
++  ASSERT_EQ(40, content::EvalJs(app_frame, R"(
++    (async () => {
++      const frame = document.querySelector('controlledframe');
++      frame.style.setProperty('position', 'fixed', 'important');
++      frame.style.setProperty('left', '0', 'important');
++      frame.style.setProperty('top', '0', 'important');
++      frame.style.setProperty('width', '320px', 'important');
++      frame.style.setProperty('height', '40px', 'important');
++      let h;
++      for (let i = 0; i < 100; i++) {
++        h = await frame.executeScript({code: 'innerHeight'});
++        if (h[0] === 40) {
++          return 40;
++        }
++        await new Promise(r => setTimeout(r, 50));
++      }
++      return JSON.stringify(h) + ' ' +
++          JSON.stringify(frame.getBoundingClientRect()) + ' ' +
++          frame.getAttribute('style') + ' ' + getComputedStyle(frame).height;
++    })();
++  )"));
++
++  // Paint the guest green. Alternate between two nearly identical greens on
++  // every animation frame so that the (damage-driven) capturer keeps
++  // delivering frames.
++  ASSERT_TRUE(content::ExecJs(guest->GetGuestMainFrame(), R"(
++    document.body.innerHTML = '';
++    let flip = false;
++    (function paint() {
++      flip = !flip;
++      document.documentElement.style.background =
++          flip ? 'rgb(0, 255, 0)' : 'rgb(0, 254, 0)';
++      requestAnimationFrame(paint);
++    })();
++  )"));
++
++  // The track delivers frames that show the guest's content.
++  EXPECT_EQ("green", content::EvalJs(app_frame, R"(
++    (async () => {
++      const frame = document.querySelector('controlledframe');
++      const stream = await frame.captureStream({maxWidth: 320,
++                                                maxHeight: 240});
++      if (stream.getVideoTracks().length !== 1) {
++        return 'wrong track count';
++      }
++      window.captureTrack = stream.getVideoTracks()[0];
++      const reader = new MediaStreamTrackProcessor(
++          {track: captureTrack.clone()}).readable.getReader();
++      let last = '';
++      for (let i = 0; i < 100; i++) {
++        const {value} = await reader.read();
++        const c = new OffscreenCanvas(value.displayWidth,
++                                      value.displayHeight);
++        const ctx = c.getContext('2d');
++        ctx.drawImage(value, 0, 0);
++        const d = ctx.getImageData(c.width >> 1, c.height >> 1, 1, 1).data;
++        const buf = new Uint8Array(value.allocationSize());
++        const layout = await value.copyTo(buf);
++        const yc = buf[layout[0].offset +
++                       (value.codedHeight >> 1) * layout[0].stride +
++                       (value.codedWidth >> 1)];
++        last = `${d[0]},${d[1]},${d[2]} ${value.format} ` +
++               `${value.displayWidth}x${value.displayHeight} Y=${yc}`;
++        value.close();
++        if (d[0] < 60 && d[1] > 180 && d[2] < 60) {
++          reader.cancel();
++          return 'green';
++        }
++      }
++      return 'no green frame, last pixel ' + last + ' app viewport ' +
++          innerWidth + 'x' + innerHeight + ' element ' +
++          JSON.stringify(frame.getBoundingClientRect());
++    })();
++  )"));
++
++  // Obtain a second stream id without consuming it: the element passes the
++  // id to navigator.mediaDevices.getUserMedia() in the page's world.
++  const std::string stream_id = content::EvalJs(app_frame, R"(
++    (async () => {
++      const realGetUserMedia = navigator.mediaDevices.getUserMedia;
++      let id = '';
++      navigator.mediaDevices.getUserMedia = (constraints) => {
++        id = constraints.video.mandatory.chromeMediaSourceId;
++        return Promise.reject(new Error('intercepted'));
++      };
++      await document.querySelector('controlledframe').captureStream()
++          .catch(() => {});
++      navigator.mediaDevices.getUserMedia = realGetUserMedia;
++      return id;
++    })();
++  )")
++                                    .ExtractString();
++  ASSERT_FALSE(stream_id.empty());
++  const std::string use_id_script = content::JsReplace(R"(
++    navigator.mediaDevices.getUserMedia({video: {mandatory: {
++        chromeMediaSource: 'desktop', chromeMediaSourceId: $1}}})
++      .then(s => { s.getTracks().forEach(t => t.stop()); return 'success'; },
++            e => 'error')
++  )",
++                                                       stream_id);
++
++  // Another window of the same app (same origin, different frame) cannot
++  // use the id.
++  content::RenderFrameHost* other_app_frame = OpenApp(url_info.app_id());
++  ASSERT_NE(other_app_frame, app_frame);
++  EXPECT_EQ("error", content::EvalJs(other_app_frame, use_id_script));
++
++  // A page of another origin cannot use the id.
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(
++      browser(), embedded_https_test_server().GetURL("/index.html")));
++  EXPECT_EQ("error", content::EvalJs(browser()
++                                         ->tab_strip_model()
++                                         ->GetActiveWebContents()
++                                         ->GetPrimaryMainFrame(),
++                                     use_id_script));
++
++  // The guest itself cannot use the id.
++  EXPECT_EQ("error",
++            content::EvalJs(guest->GetGuestMainFrame(), use_id_script));
++
++  // The owner can (the id was valid all along), but only once.
++  EXPECT_EQ("success", content::EvalJs(app_frame, use_id_script));
++  EXPECT_EQ("error", content::EvalJs(app_frame, use_id_script));
++
++  // The browser refuses to issue an id for the guest to a frame that does not
++  // own it, even if that frame names the guest's instance id. A same-process
++  // frame (an about:blank iframe of the app) gets an error from the owner
++  // check.
++  auto get_id_from = [&](content::RenderFrameHost* rfh) {
++    auto function = base::MakeRefCounted<
++        extensions::WebViewInternalGetCaptureStreamIdFunction>();
++    function->SetName("webViewInternal.getCaptureStreamId");
++    function->SetRenderFrameHost(rfh);
++    function->set_source_process_id(rfh->GetProcess()->GetDeprecatedID());
++    return extensions::api_test_utils::RunFunctionAndReturnError(
++        function.get(), content::JsReplace("[$1]", guest->guest_instance_id()),
++        profile());
++  };
++  ASSERT_TRUE(content::ExecJs(app_frame, R"(
++    new Promise(resolve => {
++      const f = document.createElement('iframe');
++      f.name = 'not-the-owner';
++      f.onload = resolve;
++      document.body.appendChild(f);
++    });
++  )"));
++  content::RenderFrameHost* app_iframe = content::FrameMatchingPredicate(
++      app_frame->GetPage(),
++      base::BindRepeating(&content::FrameMatchesName, "not-the-owner"));
++  ASSERT_TRUE(app_iframe);
++  ASSERT_EQ(app_iframe->GetProcess(), app_frame->GetProcess());
++  EXPECT_EQ("Only the embedder of the guest can capture it",
++            get_id_from(app_iframe));
++  // The owner gets an id the same way.
++  {
++    auto function = base::MakeRefCounted<
++        extensions::WebViewInternalGetCaptureStreamIdFunction>();
++    function->SetName("webViewInternal.getCaptureStreamId");
++    function->SetRenderFrameHost(app_frame);
++    function->set_source_process_id(app_frame->GetProcess()->GetDeprecatedID());
++    std::optional<base::Value> result =
++        extensions::api_test_utils::RunFunctionAndReturnSingleResult(
++            function.get(),
++            content::JsReplace("[$1]", guest->guest_instance_id()), profile());
++    ASSERT_TRUE(result && result->is_string());
++    EXPECT_FALSE(result->GetString().empty());
++  }
++  // A frame in another process that names the guest is treated as a bad
++  // renderer by the guest view manager (existing behaviour) and is killed.
++  if (other_app_frame->GetProcess() != app_frame->GetProcess()) {
++    content::ScopedAllowRendererCrashes allow_crashes(other_app_frame);
++    content::RenderProcessHostWatcher watcher(
++        other_app_frame->GetProcess(),
++        content::RenderProcessHostWatcher::WATCH_FOR_PROCESS_EXIT);
++    EXPECT_EQ("Could not find guest", get_id_from(other_app_frame));
++    watcher.Wait();
++  }
++
++  // Removing the element destroys the guest and ends the track.
++  ASSERT_TRUE(content::ExecJs(
++      app_frame, "document.querySelector('controlledframe').remove();"));
++  guest_view_manager()->WaitForAllGuestsDeleted();
++  EXPECT_EQ("ended", content::EvalJs(app_frame, R"(
++    (async () => {
++      for (let i = 0; i < 100 && captureTrack.readyState !== 'ended'; i++) {
++        await new Promise(r => setTimeout(r, 50));
++      }
++      return captureTrack.readyState;
++    })();
++  )"));
+ }
+ 
+ IN_PROC_BROWSER_TEST_F(ControlledFrameApiTest, EnterFullScreenControlledFrame) {
+diff --git a/chrome/renderer/resources/controlled_frame/html_controlled_frame_element.js b/chrome/renderer/resources/controlled_frame/html_controlled_frame_element.js
+--- a/chrome/renderer/resources/controlled_frame/html_controlled_frame_element.js
++++ b/chrome/renderer/resources/controlled_frame/html_controlled_frame_element.js
+@@ -24,6 +24,19 @@
+ const WebViewElement = require('webViewElement').WebViewElement;
+ const WebViewInternal = getInternalApi('webViewInternal');
+ 
++// Experiment: a rejected promise. The safe $Promise in this context
++// has no reject(), only the constructor ($Promise.self), race() and resolve().
++function rejectedPromise(error) {
++  return new $Promise.self((resolve, reject) => reject(error));
++}
++
++// Experiment: the guest's instance id, or 0 if there is none (not
++// created yet, destroyed, or the element was never attached).
++function currentGuestId(element) {
++  const internal = privates(element).internal;
++  return (internal && internal.guest && internal.guest.getId()) || 0;
++}
++
+ // The Web naming conventions for enums are kebab-case while the WebView naming
+ // conventions which are snake case. Convert from the kebab case convention to
+ // the snake case convention.
+@@ -149,4 +162,45 @@
+         internal.viewInstanceId, names, callback);
++  }
++
++  // Returns a Promise<MediaStream> with one video track that shows the guest's
++  // contents. `options` may contain maxWidth, maxHeight, maxFrameRate (and
++  // minWidth/minHeight/minFrameRate), passed through as getUserMedia legacy
++  // "mandatory" constraints. Only the owning embedder frame can use the
++  // stream id; the track ends when the guest is destroyed.
++  captureStream(options) {
++    let guestId;
++    try {
++      guestId = currentGuestId(this);
++    } catch (e) {
++      return rejectedPromise(e);
++    }
++    if (!guestId) {
++      return rejectedPromise(new Error('The frame has no guest'));
++    }
++    const mandatory = {__proto__: null};
++    if (options) {
++      for (const key of ['maxWidth', 'maxHeight', 'maxFrameRate', 'minWidth',
++                         'minHeight', 'minFrameRate']) {
++        if (options[key] !== undefined) {
++          mandatory[key] = options[key];
++        }
++      }
++    }
++    return new $Promise.self((resolve, reject) => {
++      WebViewInternal.getCaptureStreamId(guestId, (streamId) => {
++        if (bindingUtil.hasLastError()) {
++          const error = bindingUtil.getLastErrorMessage();
++          bindingUtil.clearLastError();
++          reject(new Error(error));
++          return;
++        }
++        mandatory.chromeMediaSource = 'desktop';
++        mandatory.chromeMediaSourceId = streamId;
++        navigator.mediaDevices
++            .getUserMedia({audio: false, video: {mandatory}})
++            .then(resolve, reject);
++      });
++    });
+   }
+ 
+   canGoBack() {
+diff --git a/chrome/test/data/controlled_frame/resources/expected_properties.json b/chrome/test/data/controlled_frame/resources/expected_properties.json
+--- a/chrome/test/data/controlled_frame/resources/expected_properties.json
++++ b/chrome/test/data/controlled_frame/resources/expected_properties.json
+@@ -10,6 +10,7 @@
+     "back",
+     "canGoBack",
+     "canGoForward",
++    "captureStream",
+     "captureVisibleRegion",
+     "clearData",
+     "constructor",
+diff --git a/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc b/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
+--- a/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
++++ b/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
+@@ -22,9 +22,13 @@
+ #include "base/values.h"
+ #include "components/crash/core/common/crash_key.h"
+ #include "content/public/browser/browser_context.h"
++#include "content/public/browser/desktop_media_id.h"
++#include "content/public/browser/desktop_streams_registry.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/render_view_host.h"
+ #include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_media_capture_id.h"
+ #include "content/public/common/stop_find_action.h"
+ #include "content/public/common/url_constants.h"
+ #include "extensions/browser/extension_api_frame_id_map.h"
+@@ -323,4 +327,43 @@
+       WebViewGuest::FromInstanceID(source_process_id(), instance_id_));
++}
++
++ExtensionFunction::ResponseAction
++WebViewInternalGetCaptureStreamIdFunction::Run() {
++  WebViewGuest& guest = GetGuest();
++  content::RenderFrameHost* caller = render_frame_host();
++  // Only the frame that owns the guest may capture it.
++  if (!caller || !guest.attached() || guest.owner_rfh() != caller) {
++    return RespondNow(Error("Only the embedder of the guest can capture it"));
++  }
++  content::RenderFrameHost* guest_main_frame = guest.GetGuestMainFrame();
++  content::WebContents* embedder_contents =
++      content::WebContents::FromRenderFrameHost(caller);
++  content::WebContents* guest_contents =
++      content::WebContents::FromRenderFrameHost(guest_main_frame);
++  // With GuestViewMPArch the guest page lives in the embedder's WebContents,
++  // so a WebContents capture would capture the whole embedder. Not supported.
++  if (!guest_main_frame || !guest_contents ||
++      guest_contents == embedder_contents) {
++    return RespondNow(Error("Capture is not supported for this guest"));
++  }
++
++  content::DesktopMediaID source(
++      content::DesktopMediaID::TYPE_WEB_CONTENTS,
++      content::DesktopMediaID::kNullId,
++      content::WebContentsMediaCaptureId(
++          guest_main_frame->GetProcess()->GetDeprecatedID(),
++          guest_main_frame->GetRoutingID()));
++
++  // DesktopCaptureAccessHandler validates the id against the primary main
++  // frame of the requesting WebContents and the requesting frame's origin.
++  content::RenderFrameHost* embedder_main_frame =
++      embedder_contents->GetPrimaryMainFrame();
++  std::string id =
++      content::DesktopStreamsRegistry::GetInstance()->RegisterStream(
++          embedder_main_frame->GetProcess()->GetDeprecatedID(),
++          embedder_main_frame->GetRoutingID(), caller->GetLastCommittedOrigin(),
++          source, content::kRegistryStreamTypeDesktop);
++  return RespondNow(WithArguments(id));
+ }
+ 
+ WebViewInternalCaptureVisibleRegionFunction::
+diff --git a/extensions/browser/api/guest_view/web_view/web_view_internal_api.h b/extensions/browser/api/guest_view/web_view/web_view_internal_api.h
+--- a/extensions/browser/api/guest_view/web_view/web_view_internal_api.h
++++ b/extensions/browser/api/guest_view/web_view/web_view_internal_api.h
+@@ -46,6 +46,29 @@
+   int instance_id_ = 0;
+ };
+ 
++// Registers a one-shot media stream id for the guest's contents, bound to the
++// calling (owner) frame's main frame and origin. The embedder turns the id into
++// a MediaStream with getUserMedia({video: {mandatory: {chromeMediaSource:
++// 'desktop', chromeMediaSourceId: id}}}).
++class WebViewInternalGetCaptureStreamIdFunction
++    : public WebViewInternalExtensionFunction {
++ public:
++  DECLARE_EXTENSION_FUNCTION("webViewInternal.getCaptureStreamId",
++                             WEBVIEWINTERNAL_GETCAPTURESTREAMID)
++  WebViewInternalGetCaptureStreamIdFunction() = default;
++  WebViewInternalGetCaptureStreamIdFunction(
++      const WebViewInternalGetCaptureStreamIdFunction&) = delete;
++  WebViewInternalGetCaptureStreamIdFunction& operator=(
++      const WebViewInternalGetCaptureStreamIdFunction&) = delete;
++
++ protected:
++  ~WebViewInternalGetCaptureStreamIdFunction() override = default;
++
++ private:
++  // WebViewInternalExtensionFunction implementation.
++  ResponseAction Run() override;
++};
++
+ class WebViewInternalCaptureVisibleRegionFunction
+     : public WebViewInternalExtensionFunction,
+       public WebContentsCaptureClient {
+diff --git a/extensions/browser/extension_function_histogram_value.h b/extensions/browser/extension_function_histogram_value.h
+--- a/extensions/browser/extension_function_histogram_value.h
++++ b/extensions/browser/extension_function_histogram_value.h
+@@ -2059,6 +2059,7 @@
+   CONTEXTUALTASKSPRIVATE_REGISTERAIMTHREADFORPROMO = 1994,
+   AUTOFILLPRIVATE_GETLOYALTYCARDLIST = 1995,
+   AUTOFILLPRIVATE_GETWALLETDIRECTOFFERLIST = 1996,
++  WEBVIEWINTERNAL_GETCAPTURESTREAMID = 1997,
+   // Last entry: Add new entries above, then run:
+   // tools/metrics/histograms/update_extension_histograms.py
+   ENUM_BOUNDARY
+diff --git a/extensions/common/api/web_view_internal.json b/extensions/common/api/web_view_internal.json
+--- a/extensions/common/api/web_view_internal.json
++++ b/extensions/common/api/web_view_internal.json
+@@ -745,5 +745,23 @@
+         ]
+       },
+       {
++        "name": "getCaptureStreamId",
++        "type": "function",
++        "description": "Registers a media stream id for capturing the guest's contents. Only the guest's embedder frame may call this and use the id.",
++        "parameters": [
++          {
++            "type": "integer",
++            "name": "instanceId",
++            "description": "The instance ID of the guest <webview> process."
++          }
++        ],
++        "returns_async": {
++          "name": "callback",
++          "parameters": [
++            {"type": "string", "name": "streamId"}
++          ]
++        }
++      },
++      {
+         "name": "captureVisibleRegion",
+         "type": "function",
+diff --git a/tools/metrics/histograms/metadata/extensions/enums.xml b/tools/metrics/histograms/metadata/extensions/enums.xml
+--- a/tools/metrics/histograms/metadata/extensions/enums.xml
++++ b/tools/metrics/histograms/metadata/extensions/enums.xml
+@@ -2951,6 +2951,7 @@
+   <int value="1994" label="CONTEXTUALTASKSPRIVATE_REGISTERAIMTHREADFORPROMO"/>
+   <int value="1995" label="AUTOFILLPRIVATE_GETLOYALTYCARDLIST"/>
+   <int value="1996" label="AUTOFILLPRIVATE_GETWALLETDIRECTOFFERLIST"/>
++  <int value="1997" label="WEBVIEWINTERNAL_GETCAPTURESTREAMID"/>
+ </enum>
+ 
+ <!-- LINT.ThenChange(//extensions/browser/extension_function_histogram_value.h:HistogramValue) -->

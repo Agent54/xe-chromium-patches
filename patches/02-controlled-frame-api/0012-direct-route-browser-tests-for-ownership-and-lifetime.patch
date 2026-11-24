@@ -1,0 +1,392 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 14:59:42 +0000
+Subject: [PATCH 12/50] direct route: browser tests for ownership and lifetime
+
+ControlledFrameTextureSourceTest.Ownership: the owner reads the guest's
+pixels; a cross-origin iframe that is not a guest is refused; the
+browser-side check (content::CanReadGuestFrameTextureForTesting) passes
+for the owner and fails for another window of the same app, the guest
+itself and a same-origin, same-process child frame of the app.
+ControlledFrameTextureSourceTest.Lifetime: a pending read resolves null
+when the element is removed or the guest's renderer is killed, and
+continues with the new page when the guest navigates cross-site.
+---
+diff --git a/chrome/browser/controlled_frame/controlled_frame_apitest.cc b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+--- a/chrome/browser/controlled_frame/controlled_frame_apitest.cc
++++ b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+@@ -46,8 +46,11 @@
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_exposed_isolation_level.h"
+ #include "content/public/common/content_features.h"
++#include "content/public/common/result_codes.h"
+ #include "content/public/test/browser_test.h"
+ #include "content/public/test/browser_test_utils.h"
++#include "content/public/test/guest_frame_texture_test_util.h"
++#include "net/dns/mock_host_resolver.h"
+ #include "content/public/test/no_renderer_crashes_assertion.h"
+ #include "content/public/test/test_navigation_observer.h"
+ #include "content/public/test/test_utils.h"
+@@ -881,6 +884,243 @@
+       return captureTrack.readyState;
+     })();
+   )"));
++}
++
++// Experiment: the direct route (createTextureSource()).
++class ControlledFrameTextureSourceTest
++    : public ControlledFrameCaptureStreamTest {
++ public:
++  void SetUpOnMainThread() override {
++    ControlledFrameCaptureStreamTest::SetUpOnMainThread();
++    host_resolver()->AddRule("*", "127.0.0.1");
++  }
++
++ protected:
++  // Creates a controlled frame showing `url`, fixed at the top-left at
++  // 320x40 (the test app window is small), and returns its guest.
++  extensions::WebViewGuest* CreateSizedFrame(content::RenderFrameHost* app,
++                                             const GURL& url) {
++    if (!CreateControlledFrame(app, url)) {
++      return nullptr;
++    }
++    if (!content::ExecJs(app, R"(
++          (async () => {
++            const frame = document.querySelector('controlledframe');
++            frame.style.cssText = 'position:fixed;left:0;top:0;' +
++                'width:320px;height:40px';
++            for (let i = 0; i < 100; i++) {
++              const h = await frame.executeScript({code: 'innerHeight'});
++              if (h[0] === 40) return;
++              await new Promise(r => setTimeout(r, 50));
++            }
++          })();)")) {
++      return nullptr;
++    }
++    return GetWebViewGuest(app);
++  }
++
++  // Script for the app frame: reads from `src` until a frame whose centre
++  // pixel matches `want` ('green' / 'blue'), returns that word or a
++  // diagnostic.
++  static constexpr char kReadColorFn[] = R"(
++    window.readColor = async (src, want, tries = 100) => {
++      let last = '';
++      for (let i = 0; i < tries; i++) {
++        const vf = await src.read();
++        if (!vf) return 'null after ' + i + ' frames, last ' + last;
++        const c = new OffscreenCanvas(vf.displayWidth, vf.displayHeight);
++        const ctx = c.getContext('2d');
++        ctx.drawImage(vf, 0, 0);
++        const d = ctx.getImageData(c.width >> 1, c.height >> 1, 1, 1).data;
++        last = `${d[0]},${d[1]},${d[2]} ${vf.format} ${vf.displayWidth}x` +
++               `${vf.displayHeight}`;
++        vf.close();
++        if (want === 'green' && d[0] < 60 && d[1] > 180 && d[2] < 60)
++          return want;
++        if (want === 'blue' && d[0] < 60 && d[1] < 60 && d[2] > 180)
++          return want;
++      }
++      return 'no ' + want + ' frame, last ' + last;
++    };)";
++};
++
++// Only the frame that embeds a guest can read it; frames that do not embed
++// it fail the browser-side check, and a non-guest frame is refused.
++IN_PROC_BROWSER_TEST_F(ControlledFrameTextureSourceTest, Ownership) {
++  web_app::IsolatedWebAppUrlInfo url_info =
++      CreateAndInstallEmptyApp(web_app::ManifestBuilder());
++  content::RenderFrameHost* app_frame = OpenApp(url_info.app_id());
++  extensions::WebViewGuest* guest = CreateSizedFrame(
++      app_frame, embedded_https_test_server().GetURL("/index.html"));
++  ASSERT_TRUE(guest);
++  ASSERT_TRUE(content::ExecJs(guest->GetGuestMainFrame(), R"(
++    document.body.innerHTML = '';
++    let flip = false;
++    (function paint() {
++      flip = !flip;
++      document.documentElement.style.background =
++          flip ? 'rgb(0, 255, 0)' : 'rgb(0, 254, 0)';
++      requestAnimationFrame(paint);
++    })();)"));
++  ASSERT_TRUE(content::ExecJs(app_frame, kReadColorFn));
++
++  // The owner reads the guest's pixels.
++  EXPECT_EQ("green", content::EvalJs(app_frame, R"(
++    (async () => {
++      const src = await document.querySelector('controlledframe')
++          .createTextureSource({width: 320, height: 40});
++      const r = await readColor(src, 'green');
++      src.close();
++      return r;
++    })();)"));
++
++  // A cross-origin iframe that is not a guest is refused (the source ends
++  // at once without a frame).
++  EXPECT_EQ("refused", content::EvalJs(
++                           app_frame,
++                           content::JsReplace(R"(
++    (async () => {
++      const f = document.createElement('iframe');
++      const loaded = new Promise(r => f.onload = r);
++      f.src = $1;
++      document.body.appendChild(f);
++      await loaded;
++      try {
++        const src = new GuestFrameTextureSource(f, {width: 32, height: 32});
++        const vf = await src.read();
++        if (vf) { vf.close(); return 'got a frame'; }
++        return 'refused';
++      } catch (e) {
++        return 'refused';
++      }
++    })();)",
++                           embedded_https_test_server().GetURL(
++                               "other.test", "/index.html"))));
++
++  // Browser-side check, as a compromised renderer would see it.
++  content::RenderFrameHost* guest_main = guest->GetGuestMainFrame();
++  EXPECT_TRUE(content::CanReadGuestFrameTextureForTesting(app_frame, guest_main));
++  // Another window of the same app (same origin, other document).
++  content::RenderFrameHost* other_app_frame = OpenApp(url_info.app_id());
++  ASSERT_NE(other_app_frame, app_frame);
++  EXPECT_FALSE(
++      content::CanReadGuestFrameTextureForTesting(other_app_frame, guest_main));
++  // The guest itself.
++  EXPECT_FALSE(
++      content::CanReadGuestFrameTextureForTesting(guest_main, guest_main));
++  // A same-origin child frame of the app (same process as the owner).
++  ASSERT_TRUE(content::ExecJs(app_frame, R"(
++    new Promise(r => {
++      const f = document.createElement('iframe');
++      f.onload = r;
++      f.src = '/?same-origin-child';
++      document.body.appendChild(f);
++    });)"));
++  content::RenderFrameHost* child = nullptr;
++  for (size_t i = 0; content::ChildFrameAt(app_frame, i); ++i) {
++    content::RenderFrameHost* c = content::ChildFrameAt(app_frame, i);
++    if (c->GetLastCommittedURL().query() == "same-origin-child") {
++      child = c;
++    }
++  }
++  ASSERT_TRUE(child);
++  EXPECT_EQ(child->GetProcess(), app_frame->GetProcess());
++  EXPECT_FALSE(content::CanReadGuestFrameTextureForTesting(child, guest_main));
++}
++
++// A pending read resolves with null when the guest is destroyed or its
++// renderer crashes, and continues with the new page when the guest navigates
++// cross-site.
++IN_PROC_BROWSER_TEST_F(ControlledFrameTextureSourceTest, Lifetime) {
++  web_app::IsolatedWebAppUrlInfo url_info =
++      CreateAndInstallEmptyApp(web_app::ManifestBuilder());
++  content::RenderFrameHost* app_frame = OpenApp(url_info.app_id());
++  ASSERT_TRUE(content::ExecJs(app_frame, kReadColorFn));
++  constexpr char kPaint[] = R"(
++    document.body.innerHTML = '';
++    document.documentElement.style.background = $1;)";
++  constexpr char kStartPendingRead[] = R"(
++    (async () => {
++      window.src = await document.querySelector('controlledframe')
++          .createTextureSource({width: 320, height: 40});
++      // First frame (the current one); the guest is static afterwards, so
++      // the next read stays pending.
++      const first = await readColor(src, 'green', 30);
++      if (first !== 'green') return first;
++      // Wait until the guest is quiet (a read stays pending for 500 ms).
++      for (let i = 0; i < 20; i++) {
++        window.pending = src.read().then(
++            vf => { if (!vf) return 'null'; vf.close(); return 'frame'; });
++        const early = await Promise.race(
++            [pending, new Promise(r => setTimeout(() => r('pending'), 500))]);
++        if (early !== 'frame') return early;
++      }
++      return 'guest never became quiet';
++    })();)";
++
++  // 1. The element (and so the guest) is removed.
++  {
++    extensions::WebViewGuest* guest = CreateSizedFrame(
++        app_frame, embedded_https_test_server().GetURL("/index.html"));
++    ASSERT_TRUE(guest);
++    ASSERT_TRUE(content::ExecJs(guest->GetGuestMainFrame(),
++                                content::JsReplace(kPaint, "rgb(0,255,0)")));
++    ASSERT_EQ("pending", content::EvalJs(app_frame, kStartPendingRead));
++    ASSERT_TRUE(content::ExecJs(
++        app_frame, "document.querySelector('controlledframe').remove();"));
++    guest_view_manager()->WaitForAllGuestsDeleted();
++    EXPECT_EQ("null", content::EvalJs(app_frame, "pending"));
++  }
++
++  // 2. The guest navigates cross-site (new renderer, new frame sink): the
++  // pending read continues with the new page.
++  {
++    extensions::WebViewGuest* guest = CreateSizedFrame(
++        app_frame, embedded_https_test_server().GetURL("/index.html"));
++    ASSERT_TRUE(guest);
++    ASSERT_TRUE(content::ExecJs(guest->GetGuestMainFrame(),
++                                content::JsReplace(kPaint, "rgb(0,255,0)")));
++    ASSERT_EQ("pending", content::EvalJs(app_frame, kStartPendingRead));
++    const GURL cross_site =
++        embedded_https_test_server().GetURL("cross.test", "/index.html");
++    ASSERT_TRUE(content::ExecJs(app_frame, content::JsReplace(R"(
++      new Promise(r => {
++        const f = document.querySelector('controlledframe');
++        f.addEventListener('loadstop', r, {once: true});
++        f.src = $1;
++      });)",
++                                                              cross_site)));
++    content::RenderFrameHost* new_main = GetWebViewGuest(app_frame)
++                                             ->GetGuestMainFrame();
++    ASSERT_EQ(cross_site, new_main->GetLastCommittedURL());
++    ASSERT_TRUE(
++        content::ExecJs(new_main, content::JsReplace(kPaint, "rgb(0,0,255)")));
++    EXPECT_EQ("frame", content::EvalJs(app_frame, "pending"));
++    EXPECT_EQ("blue", content::EvalJs(app_frame, "readColor(src, 'blue')"));
++    ASSERT_TRUE(content::ExecJs(app_frame, R"(
++      src.close();
++      document.querySelector('controlledframe').remove();)"));
++    guest_view_manager()->WaitForAllGuestsDeleted();
++  }
++
++  // 3. The guest's renderer crashes.
++  {
++    extensions::WebViewGuest* guest = CreateSizedFrame(
++        app_frame, embedded_https_test_server().GetURL("/index.html"));
++    ASSERT_TRUE(guest);
++    ASSERT_TRUE(content::ExecJs(guest->GetGuestMainFrame(),
++                                content::JsReplace(kPaint, "rgb(0,255,0)")));
++    ASSERT_EQ("pending", content::EvalJs(app_frame, kStartPendingRead));
++    content::ScopedAllowRendererCrashes allow_crashes;
++    content::RenderProcessHost* guest_process =
++        guest->GetGuestMainFrame()->GetProcess();
++    content::RenderProcessHostWatcher watcher(
++        guest_process,
++        content::RenderProcessHostWatcher::WATCH_FOR_PROCESS_EXIT);
++    guest_process->Shutdown(content::RESULT_CODE_KILLED);
++    watcher.Wait();
++    EXPECT_EQ("null", content::EvalJs(app_frame, "pending"));
++  }
+ }
+ 
+ IN_PROC_BROWSER_TEST_F(ControlledFrameApiTest, EnterFullScreenControlledFrame) {
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+--- a/content/browser/renderer_host/guest_frame_texture_host.cc
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -168,7 +168,31 @@
+ RenderWidgetHostViewChildFrame* GuestFrameTextureHost::FindOwnedGuestView(
+     const blink::RemoteFrameToken& guest_frame,
+     WebContentsImpl** guest_contents_out) {
+-  auto* rfh = static_cast<RenderFrameHostImpl*>(&render_frame_host());
++  return FindOwnedGuestViewForFrame(&render_frame_host(), guest_frame,
++                                    guest_contents_out);
++}
++
++// static
++bool GuestFrameTextureHost::CanAccessGuestForTesting(
++    RenderFrameHost* caller,
++    RenderFrameHost* guest_main_frame) {
++  FrameTreeNode* inner_root =
++      static_cast<RenderFrameHostImpl*>(guest_main_frame)->frame_tree_node();
++  RenderFrameProxyHost* proxy =
++      inner_root->render_manager()->GetProxyToOuterDelegate();
++  if (!proxy || proxy->GetProcess() != caller->GetProcess()) {
++    return false;
++  }
++  return FindOwnedGuestViewForFrame(caller, proxy->GetFrameToken()) != nullptr;
++}
++
++// static
++RenderWidgetHostViewChildFrame*
++GuestFrameTextureHost::FindOwnedGuestViewForFrame(
++    RenderFrameHost* caller,
++    const blink::RemoteFrameToken& guest_frame,
++    WebContentsImpl** guest_contents_out) {
++  auto* rfh = static_cast<RenderFrameHostImpl*>(caller);
+   RenderFrameProxyHost* proxy = RenderFrameProxyHost::FromFrameToken(
+       rfh->GetProcess()->GetDeprecatedID(), guest_frame);
+   if (!proxy) {
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.h b/content/browser/renderer_host/guest_frame_texture_host.h
+--- a/content/browser/renderer_host/guest_frame_texture_host.h
++++ b/content/browser/renderer_host/guest_frame_texture_host.h
+@@ -52,6 +52,19 @@
+       const blink::RemoteFrameToken& guest_frame,
+       WebContentsImpl** guest_contents_out = nullptr);
+ 
++  // The ownership check used for every request, for a given calling frame.
++  static RenderWidgetHostViewChildFrame* FindOwnedGuestViewForFrame(
++      RenderFrameHost* caller,
++      const blink::RemoteFrameToken& guest_frame,
++      WebContentsImpl** guest_contents_out = nullptr);
++
++  // Test-only: whether `caller` passes the ownership check for the guest
++  // whose main frame is `guest_main_frame`, using the token of the guest's
++  // proxy in the caller's process (false if the caller's process has none,
++  // i.e. the caller could not even name the guest).
++  static bool CanAccessGuestForTesting(RenderFrameHost* caller,
++                                       RenderFrameHost* guest_main_frame);
++
+  private:
+   ~GuestFrameTextureHost() final;
+ 
+diff --git a/content/public/test/guest_frame_texture_test_util.cc b/content/public/test/guest_frame_texture_test_util.cc
+new file mode 100644
+--- /dev/null
++++ b/content/public/test/guest_frame_texture_test_util.cc
+@@ -0,0 +1,17 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/public/test/guest_frame_texture_test_util.h"
++
++#include "content/browser/renderer_host/guest_frame_texture_host.h"
++
++namespace content {
++
++bool CanReadGuestFrameTextureForTesting(RenderFrameHost* caller,
++                                        RenderFrameHost* guest_main_frame) {
++  return GuestFrameTextureHost::CanAccessGuestForTesting(caller,
++                                                         guest_main_frame);
++}
++
++}  // namespace content
+diff --git a/content/public/test/guest_frame_texture_test_util.h b/content/public/test/guest_frame_texture_test_util.h
+new file mode 100644
+--- /dev/null
++++ b/content/public/test/guest_frame_texture_test_util.h
+@@ -0,0 +1,21 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_PUBLIC_TEST_GUEST_FRAME_TEXTURE_TEST_UTIL_H_
++#define CONTENT_PUBLIC_TEST_GUEST_FRAME_TEXTURE_TEST_UTIL_H_
++
++namespace content {
++
++class RenderFrameHost;
++
++// Experiment: whether `caller` passes the browser-side ownership
++// check of GuestFrameTextureHost (blink.mojom.GuestFrameTextureHost) for the
++// guest whose main frame is `guest_main_frame`, using the token the caller's
++// process would have for it (false if it has none).
++bool CanReadGuestFrameTextureForTesting(RenderFrameHost* caller,
++                                        RenderFrameHost* guest_main_frame);
++
++}  // namespace content
++
++#endif  // CONTENT_PUBLIC_TEST_GUEST_FRAME_TEXTURE_TEST_UTIL_H_
+diff --git a/content/test/BUILD.gn b/content/test/BUILD.gn
+--- a/content/test/BUILD.gn
++++ b/content/test/BUILD.gn
+@@ -184,6 +184,8 @@
+     "../public/test/browser_test_base.cc",
+     "../public/test/browser_test_base.h",
+     "../public/test/browser_test_utils.cc",
++    "../public/test/guest_frame_texture_test_util.cc",
++    "../public/test/guest_frame_texture_test_util.h",
+     "../public/test/browser_test_utils.h",
+     "../public/test/browsing_data_remover_test_util.cc",
+     "../public/test/browsing_data_remover_test_util.h",

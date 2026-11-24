@@ -1,0 +1,371 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 20:28:08 +0000
+Subject: [PATCH 2/50] viz: VideoConferenceMatcher yields to other animating content
+
+VideoConferenceMatcher (enabled for every desktop root compositor frame
+sink, and on Android) lowered the display frame interval to the fastest
+video's interval whenever two or more videos had updated recently, without
+looking at anything else in the window: a page animating at 60 fps next to
+two 30 fps videos (or an app drawing guests that play videos) dropped to
+30 Hz.
+
+FrameIntervalDecider now keeps a short history per drawn frame sink: whether
+it submitted a new frame in each of the last 8 aggregations that drew it
+(frame_time changed), and a smoothed interval between its new frames. For
+sinks that are not video-only (video-only = has_only_content_frame_interval_
+updates with only kVideo content intervals) it fills two new
+FrameIntervalMatcher::Inputs fields:
+- has_continuous_non_video_updates: a new frame in at least 7 of the last
+  8 aggregations. This is relative to the display, because an animation
+  that takes every frame follows a lowered display rate down (at 30 Hz a
+  60 fps scene also updates at 30), so its absolute rate cannot be used.
+- fastest_non_video_update_interval: the shortest smoothed interval of a
+  sink that is still updating (its last frame no older than twice that
+  interval, at least 3 intervals seen).
+VideoConferenceMatcher returns no match if either says other content
+updates on every display frame or faster than the videos. History entries
+not drawn for 120 aggregations are dropped.
+
+Behind kVideoConferenceMatcherYieldsToAnimation (enabled by default);
+
+Tests: FrameIntervalMatchersTest.VideoConferenceYieldsToOtherContent,
+FrameIntervalDeciderTest.VideoConferenceYieldsToAnimatingScene (two 30 fps
+video sinks + a 60 fps scene keep the default rate; scene stops -> 30 Hz;
+scene animates again -> default; only the videos -> 30 Hz). viz_unittests
+*FrameInterval*, *SurfaceAggregator*, *Display* pass.
+
+Measured (Release, Wayland): two <controlledframe> guests playing a 30 fps
+video, embedder rAF: animating scene 58.0 (29.8 with the feature off), no
+animation 31.1 (29.8 off); 16 / 32 real public pages without capture: scene
+58 / 57 (29 before).
+---
+diff --git a/components/viz/common/features.cc b/components/viz/common/features.cc
+--- a/components/viz/common/features.cc
++++ b/components/viz/common/features.cc
+@@ -63,6 +63,13 @@
+ BASE_FEATURE(kVizBufferQueueDiscardOnVisibilityChange,
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ 
++// If enabled, VideoConferenceMatcher does not lower the display frame rate
++// while other (non-video) content in the window updates on (nearly) every
++// display frame or faster than the interval it would pick, e.g. an animating
++// page next to two playing videos.
++BASE_FEATURE(kVideoConferenceMatcherYieldsToAnimation,
++             base::FEATURE_ENABLED_BY_DEFAULT);
++
+ BASE_FEATURE(kUseDrmBlackFullscreenOptimization,
+ #if BUILDFLAG(IS_CHROMEOS)
+              base::FEATURE_ENABLED_BY_DEFAULT
+diff --git a/components/viz/common/features.h b/components/viz/common/features.h
+--- a/components/viz/common/features.h
++++ b/components/viz/common/features.h
+@@ -71,6 +71,7 @@
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kBufferQueue);
+ #endif
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kUseDrmBlackFullscreenOptimization);
++VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kVideoConferenceMatcherYieldsToAnimation);
+ #if BUILDFLAG(IS_ANDROID)
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(
+     kUseFrameIntervalDeciderAdaptiveFrameRate);
+diff --git a/components/viz/service/display/frame_interval_decider.cc b/components/viz/service/display/frame_interval_decider.cc
+--- a/components/viz/service/display/frame_interval_decider.cc
++++ b/components/viz/service/display/frame_interval_decider.cc
+@@ -6,7 +6,9 @@
+ 
+ #include <inttypes.h>
+ 
++#include <algorithm>
+ #include <array>
++#include <bit>
+ #include <string_view>
+ #include <utility>
+ #include <variant>
+@@ -162,6 +164,7 @@
+   FrameIntervalMatcher::Inputs matcher_inputs(settings_, frame_id_++);
+   matcher_inputs.aggregated_frame_time = frame_time;
+   matcher_inputs.inputs_map = std::move(inputs_map);
++  UpdateHistory(matcher_inputs);
+ 
+   TRACE_EVENT_INSTANT(TRACE_DISABLED_BY_DEFAULT("cc.debug"),
+                       "FrameIntervalMatcherInputs", "inputs", matcher_inputs);
+@@ -246,4 +249,67 @@
+   }
++}
++
++void FrameIntervalDecider::UpdateHistory(
++    FrameIntervalMatcher::Inputs& matcher_inputs) {
++  constexpr int kWindow = 8;
++  constexpr int kContinuousMin = 7;
++  for (const auto& [frame_sink_id, inputs] : matcher_inputs.inputs_map) {
++    SinkUpdateHistory& history = update_history_[frame_sink_id];
++    const bool new_frame = !inputs.frame_time.is_null() &&
++                           inputs.frame_time != history.last_frame_time;
++    if (new_frame && !history.last_frame_time.is_null()) {
++      const base::TimeDelta interval =
++          inputs.frame_time - history.last_frame_time;
++      // Frame times are not guaranteed to be monotonic; a non-positive
++      // interval must not enter the smoothed interval.
++      if (interval.is_positive()) {
++        history.smoothed_interval =
++            history.intervals == 0
++                ? interval
++                : (history.smoothed_interval * 3 + interval) / 4;
++        ++history.intervals;
++      }
++    }
++    if (new_frame) {
++      history.last_frame_time = inputs.frame_time;
++    }
++    history.new_frame_bits =
++        ((history.new_frame_bits << 1) | (new_frame ? 1u : 0u)) &
++        ((1u << kWindow) - 1u);
++    history.drawn = std::min(history.drawn + 1, kWindow);
++    history.last_frame_id = matcher_inputs.frame_id;
++
++    // Sinks whose only updates are videos are what the video matchers decide
++    // about; everything else is "other content".
++    const bool video_only =
++        inputs.has_only_content_frame_interval_updates &&
++        !inputs.content_interval_info.empty() &&
++        std::ranges::all_of(inputs.content_interval_info, [](const auto& info) {
++          return info.type == ContentFrameIntervalType::kVideo;
++        });
++    if (video_only || inputs.frame_time.is_null()) {
++      continue;
++    }
++    if (history.drawn == kWindow &&
++        std::popcount(history.new_frame_bits) >= kContinuousMin) {
++      matcher_inputs.has_continuous_non_video_updates = true;
++    }
++    const bool still_updating =
++        history.intervals >= 3 &&
++        matcher_inputs.aggregated_frame_time - inputs.frame_time <=
++            2 * history.smoothed_interval;
++    if (still_updating &&
++        (!matcher_inputs.fastest_non_video_update_interval ||
++         history.smoothed_interval <
++             *matcher_inputs.fastest_non_video_update_interval)) {
++      matcher_inputs.fastest_non_video_update_interval =
++          history.smoothed_interval;
++    }
++  }
++  // Forget sinks not drawn for a while.
++  base::EraseIf(update_history_, [&](const auto& entry) {
++    return matcher_inputs.frame_id - entry.second.last_frame_id > 120u;
++  });
+ }
+ 
+ // static
+diff --git a/components/viz/service/display/frame_interval_decider.h b/components/viz/service/display/frame_interval_decider.h
+--- a/components/viz/service/display/frame_interval_decider.h
++++ b/components/viz/service/display/frame_interval_decider.h
+@@ -94,9 +94,24 @@
+   Settings settings_;
+   std::vector<std::unique_ptr<FrameIntervalMatcher>> matchers_;
+ 
++  // Fills Inputs::has_continuous_non_video_updates and
++  // fastest_non_video_update_interval from `update_history_`.
++  void UpdateHistory(FrameIntervalMatcher::Inputs& matcher_inputs);
++
+   base::TimeTicks current_result_frame_time_;
+   std::optional<Result> current_result_;
+   uint64_t frame_id_ = 0u;
++
++  struct SinkUpdateHistory {
++    base::TimeTicks last_frame_time;
++    // Bit i: a new frame in the i-th most recent aggregation that drew it.
++    uint32_t new_frame_bits = 0u;
++    int drawn = 0;
++    base::TimeDelta smoothed_interval;
++    int intervals = 0;
++    uint64_t last_frame_id = 0u;
++  };
++  base::flat_map<FrameSinkId, SinkUpdateHistory> update_history_;
+ };
+ 
+ }  // namespace viz
+diff --git a/components/viz/service/display/frame_interval_decider_unittest.cc b/components/viz/service/display/frame_interval_decider_unittest.cc
+--- a/components/viz/service/display/frame_interval_decider_unittest.cc
++++ b/components/viz/service/display/frame_interval_decider_unittest.cc
+@@ -477,3 +477,74 @@
+ 
+ }  // namespace
+ }  // namespace viz
++
++namespace viz {
++
++// The decider's per-sink history feeds VideoConferenceMatcher: two 30 fps
++// video sinks next to a 60 fps scene keep the default (display) rate; once
++// the scene stops, the videos lower it as before; a window with only the
++// videos lowers it too.
++TEST_F(FrameIntervalDeciderTest, VideoConferenceYieldsToAnimatingScene) {
++  settings_.increase_frame_interval_timeout = base::Milliseconds(50);
++  // Sets up `settings_` (with the result callback); then use only the real
++  // matcher.
++  InitializeDecider();
++  std::vector<std::unique_ptr<FrameIntervalMatcher>> matchers;
++  matchers.push_back(std::make_unique<VideoConferenceMatcher>());
++  decider_->UpdateSettings(settings_, std::move(matchers));
++
++  auto video_inputs = [](base::TimeTicks t) {
++    FrameIntervalInputs inputs;
++    inputs.frame_time = t;
++    inputs.has_only_content_frame_interval_updates = true;
++    inputs.content_interval_info.push_back(
++        {ContentFrameIntervalType::kVideo, base::Hertz(30)});
++    return inputs;
++  };
++  FrameIntervalInputs scene_inputs;
++  scene_inputs.frame_time = kNow;
++  Surface* video1 = CreateSurface(FrameSinkId(0, 1), video_inputs(kNow));
++  Surface* video2 = CreateSurface(FrameSinkId(0, 2), video_inputs(kNow));
++  Surface* scene = CreateSurface(FrameSinkId(0, 3), scene_inputs);
++
++  const base::TimeDelta vsync = base::Hertz(60);
++  base::TimeTicks t = kNow;
++  // Videos update every other display frame; `scene_updates` decides whether
++  // the scene updates on every one.
++  auto run = [&](int frames, bool scene_updates,
++                 std::vector<Surface*> drawn) {
++    for (int i = 0; i < frames; ++i) {
++      t += vsync;
++      if (i % 2 == 0) {
++        UpdateFrame(video1, video_inputs(t));
++        UpdateFrame(video2, video_inputs(t));
++      }
++      if (scene_updates) {
++        scene_inputs.frame_time = t;
++        UpdateFrame(scene, scene_inputs);
++      }
++      DrawSurfaces(drawn, t);
++    }
++  };
++
++  run(60, /*scene_updates=*/true, {video1, video2, scene});
++  ASSERT_TRUE(has_result());
++  ExpectResult(TakeLastResult(), FrameIntervalClass::kDefault);
++
++  // The scene stops: the videos decide the rate.
++  run(60, /*scene_updates=*/false, {video1, video2, scene});
++  ASSERT_TRUE(has_result());
++  ExpectResult(TakeLastResult(), base::Hertz(30));
++
++  // The scene animates again: back to the display rate.
++  run(30, /*scene_updates=*/true, {video1, video2, scene});
++  ASSERT_TRUE(has_result());
++  ExpectResult(TakeLastResult(), FrameIntervalClass::kDefault);
++
++  // Only the videos in the window.
++  run(60, /*scene_updates=*/false, {video1, video2});
++  ASSERT_TRUE(has_result());
++  ExpectResult(TakeLastResult(), base::Hertz(30));
++}
++
++}  // namespace viz
+diff --git a/components/viz/service/display/frame_interval_matchers.cc b/components/viz/service/display/frame_interval_matchers.cc
+--- a/components/viz/service/display/frame_interval_matchers.cc
++++ b/components/viz/service/display/frame_interval_matchers.cc
+@@ -11,8 +11,10 @@
+ 
+ #include "base/containers/adapters.h"
+ #include "base/containers/span.h"
++#include "base/feature_list.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/trace_event/typed_macros.h"
++#include "components/viz/common/features.h"
+ #include "components/viz/common/quads/frame_interval_inputs.h"
+ #include "media/filters/video_cadence_estimator.h"
+ #include "third_party/abseil-cpp/absl/functional/overload.h"
+@@ -402,3 +404,15 @@
++    return std::nullopt;
++  }
++
++  // Do not lower the display rate below what other content in the window is
++  // using: an animation that updates on every display frame, or content that
++  // updates faster than the videos.
++  if (base::FeatureList::IsEnabled(
++          features::kVideoConferenceMatcherYieldsToAnimation) &&
++      (matcher_inputs.has_continuous_non_video_updates ||
++       (matcher_inputs.fastest_non_video_update_interval &&
++        *matcher_inputs.fastest_non_video_update_interval <
++            min_interval.value() - matcher_inputs.settings->epsilon))) {
+     return std::nullopt;
+   }
+ 
+diff --git a/components/viz/service/display/frame_interval_matchers.h b/components/viz/service/display/frame_interval_matchers.h
+--- a/components/viz/service/display/frame_interval_matchers.h
++++ b/components/viz/service/display/frame_interval_matchers.h
+@@ -152,6 +152,16 @@
+     uint64_t frame_id;
+     base::TimeTicks aggregated_frame_time;
+     base::flat_map<FrameSinkId, FrameIntervalInputs> inputs_map;
++
++    // Computed by FrameIntervalDecider from the recent history of the drawn
++    // frame sinks, ignoring sinks whose only updates are videos:
++    // Whether one of them submitted a new frame in nearly every recent
++    // aggregation (an animation that takes every frame it is given, which
++    // would follow the display down if its rate were lowered).
++    bool has_continuous_non_video_updates = false;
++    // The shortest smoothed interval between new frames of one of them that
++    // is still updating.
++    std::optional<base::TimeDelta> fastest_non_video_update_interval;
+   };
+ 
+   static std::string ResultToString(const Result& result);
+diff --git a/components/viz/service/display/frame_interval_matchers_unittest.cc b/components/viz/service/display/frame_interval_matchers_unittest.cc
+--- a/components/viz/service/display/frame_interval_matchers_unittest.cc
++++ b/components/viz/service/display/frame_interval_matchers_unittest.cc
+@@ -9,7 +9,9 @@
+ #include <variant>
+ #include <vector>
+ 
++#include "base/test/scoped_feature_list.h"
+ #include "base/time/time.h"
++#include "components/viz/common/features.h"
+ #include "perfetto/test/traced_value_test_support.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+@@ -391,4 +393,42 @@
+   ExpectNullResult(matcher.Match(inputs));
++}
++
++// Two 30 fps videos do not lower the display rate while other content updates
++// on every display frame, or faster than the videos.
++TEST(FrameIntervalMatchersTest, VideoConferenceYieldsToOtherContent) {
++  Settings settings;
++  Inputs inputs = BuildDefaultInputs(settings, /*num_sinks=*/3u);
++  VideoConferenceMatcher matcher;
++  for (uint32_t sink : {1u, 2u}) {
++    FrameIntervalInputs& video = inputs.inputs_map[FrameSinkId(0, sink)];
++    video.content_interval_info.push_back(
++        {ContentFrameIntervalType::kVideo, base::Hertz(30)});
++    video.has_only_content_frame_interval_updates = true;
++  }
++  ExpectResult(matcher.Match(inputs), base::Hertz(30),
++               ResultIntervalType::kExact);
++
++  // An animation that takes every display frame (e.g. a WebGL scene).
++  inputs.has_continuous_non_video_updates = true;
++  ExpectNullResult(matcher.Match(inputs));
++  inputs.has_continuous_non_video_updates = false;
++
++  // Content updating at 60 fps.
++  inputs.fastest_non_video_update_interval = base::Hertz(60);
++  ExpectNullResult(matcher.Match(inputs));
++
++  // Content updating slower than the videos does not keep the rate up.
++  inputs.fastest_non_video_update_interval = base::Hertz(10);
++  ExpectResult(matcher.Match(inputs), base::Hertz(30),
++               ResultIntervalType::kExact);
++
++  // The previous behaviour, behind the feature.
++  base::test::ScopedFeatureList disabled;
++  disabled.InitAndDisableFeature(
++      features::kVideoConferenceMatcherYieldsToAnimation);
++  inputs.has_continuous_non_video_updates = true;
++  ExpectResult(matcher.Match(inputs), base::Hertz(30),
++               ResultIntervalType::kExact);
+ }
+ 
+ TEST(FrameIntervalMatchersTest, VideoConferenceFixedInterval) {

@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 12:41:01 +0000
+Subject: [PATCH 35/50] experiment: GPU-backed NV12 capture frames on NVIDIA/Wayland
+
+- FrameSinkCaptureNativeHandleSharedImages (default off): capture frames
+  as non-CPU-mappable shared images (no GBM_BO_USE_LINEAR; NVIDIA can only
+  import pitch-linear dmabufs as external, read-only textures).
+- NativePixmapEGLBinding: pass the modifier for single-plane imports (both
+  32-bit halves are pushed without a checked cast, so a modifier with bit 31
+  set does not crash) and retry a GR88/GR1616 plane as RG88/RG1616 (NVIDIA
+  EGL lists only the RG variants and uses GL RG byte order for them).
+- viz: chain the copy's finished proc as a cleanup task so the Vulkan
+  fence-helper cleanup does not hit a CHECK.
+---
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -1179,8 +1179,17 @@
+     GrFlushInfo flush_info;
+     flush_info.fNumSemaphores = end_semaphores.size();
+     flush_info.fSignalSemaphores = end_semaphores.data();
+-    flush_info.fFinishedProc = ganesh_finished_proc;
+-    flush_info.fFinishedContext = finished_context;
++    // Experiment: AddVulkanCleanupTaskForSkiaFlush() CHECKs that any
++    // existing finished proc is its own; a copy into a mappable/native-handle
++    // shared image sets a different one (ReadbackContextTexture). Chain the
++    // caller's proc as a cleanup task instead of setting it directly.
++    if (ganesh_finished_proc) {
++      gpu::AddCleanupTaskForSkiaFlush(
++          base::BindOnce(
++              [](GrGpuFinishedProc proc, void* context) { proc(context); },
++              ganesh_finished_proc, finished_context),
++          &flush_info);
++    }
+     gpu::AddVulkanCleanupTaskForSkiaFlush(vulkan_context_provider_,
+                                           &flush_info);
+     GrDirectContext::FlushResult flush_result =
+diff --git a/content/browser/media/capture/frame_sink_video_capture_device.cc b/content/browser/media/capture/frame_sink_video_capture_device.cc
+--- a/content/browser/media/capture/frame_sink_video_capture_device.cc
++++ b/content/browser/media/capture/frame_sink_video_capture_device.cc
+@@ -7,6 +7,7 @@
+ #include <optional>
+ 
+ #include "base/check_op.h"
++#include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/location.h"
+@@ -47,5 +48,12 @@
+ 
+ namespace {
++
++// Experiment: allocate captured frames as GPU shared images that are
++// not CPU-mappable (kPreferSharedImageWithNativeHandle) instead of mappable
++// ones. On Linux this drops GBM_BO_USE_LINEAR, which NVIDIA's EGL can only
++// import as an external (read-only) texture, so viz could not render into it.
++BASE_FEATURE(kFrameSinkCaptureNativeHandleSharedImages,
++             base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ #if !BUILDFLAG(IS_IOS)
+ constexpr int32_t kMouseCursorStackingIndex = 1;
+@@ -618,7 +626,11 @@
+   capturer_->Start(
+       this,
+       buffer_format_preference_.value_or(
+-          viz::mojom::BufferFormatPreference::kPreferMappableSharedImage));
++          base::FeatureList::IsEnabled(kFrameSinkCaptureNativeHandleSharedImages)
++              ? viz::mojom::BufferFormatPreference::
++                    kPreferSharedImageWithNativeHandle
++              : viz::mojom::BufferFormatPreference::
++                    kPreferMappableSharedImage));
+ }
+ 
+ void FrameSinkVideoCaptureDevice::MaybeStopConsuming() {
+diff --git a/ui/ozone/common/native_pixmap_egl_binding.cc b/ui/ozone/common/native_pixmap_egl_binding.cc
+--- a/ui/ozone/common/native_pixmap_egl_binding.cc
++++ b/ui/ozone/common/native_pixmap_egl_binding.cc
+@@ -26,6 +26,8 @@
+ #define DRM_FORMAT_R8 FOURCC('R', '8', ' ', ' ')
+ #define DRM_FORMAT_R16 FOURCC('R', '1', '6', ' ')
+ #define DRM_FORMAT_GR88 FOURCC('G', 'R', '8', '8')
++#define DRM_FORMAT_RG88 FOURCC('R', 'G', '8', '8')
++#define DRM_FORMAT_RG1616 FOURCC('R', 'G', '3', '2')
+ #define DRM_FORMAT_GR1616 FOURCC('G', 'R', '3', '2')
+ #define DRM_FORMAT_RGB565 FOURCC('R', 'G', '1', '6')
+ #define DRM_FORMAT_ARGB8888 FOURCC('A', 'R', '2', '4')
+@@ -252,12 +254,46 @@
+     PushEGLintOrDie(pixmap->GetDmaBufOffset(pixmap_plane), attrs);
+     attrs.push_back(EGL_DMA_BUF_PLANE0_PITCH_EXT);
+     attrs.push_back(pixmap->GetDmaBufPitch(pixmap_plane));
++    // Experiment: pass the modifier for single-plane imports too;
++    // without it a tiled (e.g. NVIDIA block-linear) plane is imported as
++    // linear.
++    const uint64_t modifier = pixmap->GetFormatModifier();
++    if (gl::GLSurfaceEGL::GetGLDisplayEGL()
++            ->ext->b_EGL_EXT_image_dma_buf_import_modifiers &&
++        modifier != gfx::NativePixmapHandle::kNoModifier) {
++      attrs.push_back(EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT);
++      // The modifier halves use all 32 bits; a plain checked cast to EGLint
++      // would crash when bit 31 is set (e.g. vendor modifiers).
++      attrs.push_back(static_cast<EGLint>(modifier & 0xffffffff));
++      attrs.push_back(EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT);
++      attrs.push_back(static_cast<EGLint>(static_cast<uint32_t>(modifier >> 32)));
++    }
+     attrs.push_back(EGL_NONE);
+   }
+ 
+   egl_image_ =
+       gl::MakeScopedEGLImage(EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
+                              static_cast<EGLClientBuffer>(nullptr), &attrs[0]);
++  if (!egl_image_.get() && plane_index_.has_value()) {
++    // Experiment: NVIDIA's EGL does not accept DRM_FORMAT_GR88 /
++    // GR1616 for a single plane (e.g. the UV plane of NV12), but accepts
++    // RG88 / RG1616 and samples/renders them in GL RG order (byte 0 = R),
++    // which is what GR88 means. Retry with those fourccs.
++    const uint32_t fourcc = GetFourCCFormatFromSharedImageFormat(format);
++    uint32_t alt = DRM_FORMAT_INVALID;
++    if (fourcc == DRM_FORMAT_GR88) {
++      alt = DRM_FORMAT_RG88;
++    } else if (fourcc == DRM_FORMAT_GR1616) {
++      alt = DRM_FORMAT_RG1616;
++    }
++    if (alt != DRM_FORMAT_INVALID) {
++      CHECK_EQ(attrs[4], EGL_LINUX_DRM_FOURCC_EXT);
++      attrs[5] = base::checked_cast<EGLint>(alt);
++      egl_image_ = gl::MakeScopedEGLImage(
++          EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
++          static_cast<EGLClientBuffer>(nullptr), &attrs[0]);
++    }
++  }
+   if (!egl_image_.get()) {
+     return false;
+   }

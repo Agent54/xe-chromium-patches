@@ -1,0 +1,96 @@
+From 97435c719166070069d0d339eeea9c4e46f3acbb Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Mon, 23 Nov 2026 01:03:40 +0000
+Subject: [PATCH 48/50] TransformedRemoteFrameBrowserTest: add experimental zoom,
+ settle, and will-change parameter
+
+Extends TransformedRemoteFrameBrowserTest (introduced in patch 0003)
+from bool to int parameters (0 = disabled, 1 = defaults, 2 = defaults +
+QuantizeRemoteFrameCompositingScale, HoldCompositingScaleWhileTransforming,
+RemoteFrameScaleChangeKeepsSurface, StaggerCompositingScaleSteps,
+ShortHoldForUpwardScaleSteps, StepWhenTransformSettles, and
+WillChangeTransformHoldsScale) and adds the scale-only surface-keeping
+assertion for parameter 2.
+---
+ .../site_per_process_hit_test_browsertest.cc  | 38 ++++++++++++++-----
+ 1 file changed, 28 insertions(+), 10 deletions(-)
+
+diff --git a/content/browser/site_per_process_hit_test_browsertest.cc b/content/browser/site_per_process_hit_test_browsertest.cc
+index f6f7aef..b73b9c7 100644
+--- a/content/browser/site_per_process_hit_test_browsertest.cc
++++ b/content/browser/site_per_process_hit_test_browsertest.cc
+@@ -8005,26 +8005,35 @@ IN_PROC_BROWSER_TEST_F(SitePerProcessHitTestTrustedUserActivationTriggersTest,
+ // transformed bounding-box size changes). Input, IntersectionObserver, the
+ // compositing scale (raster sharpness) and the child's screen rect must stay
+ // correct either way.
++// Parameter: 0 = RemoteFrameSurfaceIgnoresTransformedSize off; 1 = defaults
++// (on); 2 = also the experimental zoom, settle, and will-change features.
+ class TransformedRemoteFrameBrowserTest
+     : public SitePerProcessBrowserTestBase,
+-      public ::testing::WithParamInterface<bool> {
++      public ::testing::WithParamInterface<int> {
+  public:
+   TransformedRemoteFrameBrowserTest() {
+-    if (GetParam()) {
+-      feature_list_.InitFromCommandLine(
+-          "RemoteFrameSurfaceIgnoresTransformedSize", "");
+-    } else {
++    if (GetParam() == 0) {
+       feature_list_.InitFromCommandLine(
+           "", "RemoteFrameSurfaceIgnoresTransformedSize");
++    } else if (GetParam() == 2) {
++      feature_list_.InitFromCommandLine(
++          "QuantizeRemoteFrameCompositingScale,"
++          "HoldCompositingScaleWhileTransforming,"
++          "RemoteFrameScaleChangeKeepsSurface,StaggerCompositingScaleSteps,"
++          "ShortHoldForUpwardScaleSteps,StepWhenTransformSettles,"
++          "WillChangeTransformHoldsScale",
++          "");
+     }
+   }
+ 
+  protected:
++  bool transformed_size_keeps_surface() const { return GetParam() >= 1; }
++  bool scale_change_keeps_surface() const { return GetParam() == 2; }
+   base::test::ScopedFeatureList feature_list_;
+ };
+ 
+ INSTANTIATE_TEST_SUITE_P(All, TransformedRemoteFrameBrowserTest,
+-                         ::testing::Bool());
++                         ::testing::Values(0, 1, 2));
+ 
+ IN_PROC_BROWSER_TEST_P(TransformedRemoteFrameBrowserTest,
+                        DynamicTransformKeepsInputScaleAndIntersection) {
+@@ -8094,7 +8103,7 @@ IN_PROC_BROWSER_TEST_P(TransformedRemoteFrameBrowserTest,
+   // Child point (100, 100) -> 150 + R30 * (50, 50) = (168.3, 218.3).
+   EXPECT_TRUE(click_lands_at(gfx::Point(168, 218), 100, 100));
+   EXPECT_EQ(compositing_scale(), .5f);
+-  if (GetParam()) {
++  if (transformed_size_keeps_surface()) {
+     EXPECT_EQ(before_rotation, child_surface());
+   }
+ 
+@@ -8122,11 +8131,20 @@ IN_PROC_BROWSER_TEST_P(TransformedRemoteFrameBrowserTest,
+     return EvalJs(child, "io.intersecting === true").ExtractBool();
+   }));
+ 
+-  // 5. Back to 1:1: the compositing scale (raster scale) returns to 1.
+-  ASSERT_TRUE(set_transform("none"));
++  // 5. Back to 1:1: the compositing scale (raster scale) returns to 1. With
++  // RemoteFrameScaleChangeKeepsSurface a scale-only change keeps the child's
++  // surface (the child re-rasters into it).
++  ASSERT_TRUE(set_transform("translate(10px, 10px) scale(0.5)"));
++  EXPECT_TRUE(
++      base::test::RunUntil([&]() { return compositing_scale() == .5f; }));
++  const viz::LocalSurfaceId before_scale = child_surface();
++  ASSERT_TRUE(set_transform("translate(10px, 10px)"));
+   EXPECT_TRUE(
+       base::test::RunUntil([&]() { return compositing_scale() == 1.f; }));
+-  EXPECT_TRUE(click_lands_at(gfx::Point(100, 100), 100, 100));
++  if (scale_change_keeps_surface()) {
++    EXPECT_EQ(before_scale, child_surface());
++  }
++  EXPECT_TRUE(click_lands_at(gfx::Point(110, 110), 100, 100));
+ }
+ 
+ }  // namespace content

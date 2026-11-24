@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 21:06:42 +0000
+Subject: [PATCH 40/50] Experiment: track a render pass's clip in its own space (kTrackRenderPassClipInPassSpace)
+
+UpdateNeedsRedraw() (surface_aggregator.cc) marks a pass
+has_damage_from_contributing_content when its 'parent clip rect' expands
+compared with the previous frame. That rect was kept in root-target space,
+so a pass that merely moves on screen - e.g. a card that is rotated (cannot
+be merged) and whose transform changes every frame - always 'expanded' and
+was redrawn although its content and its visible part did not change. With
+kTrackRenderPassClipInPassSpace (disabled by default) the clip is mapped
+into the pass's own space (inverse of the pass-to-root transform, enclosing
+projection, intersected with output_rect) before it is compared and stored;
+a non-invertible transform keeps the old behaviour.
+
+This only saves work where undamaged non-root passes may be skipped
+(DirectRenderer::CanSkipRenderPass: kAllowUndamagedNonrootRenderPassToSkip,
+enabled by default on macOS only) and where the child's frames do not
+change (see the RemoteFrameView changes for that).
+---
+diff --git a/components/viz/common/features.cc b/components/viz/common/features.cc
+--- a/components/viz/common/features.cc
++++ b/components/viz/common/features.cc
+@@ -69,6 +69,13 @@
+ // its own render pass.
+ BASE_FEATURE(kMergeSurfacesWithIdleCapture, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
++// Experiment: the aggregator tracks a render pass's clip ("parent clip
++// rect") in the pass's own coordinate space instead of the root target's, so
++// moving a non-merged pass (e.g. a rotated card) does not count as its visible
++// area expanding and does not force it to be redrawn.
++BASE_FEATURE(kTrackRenderPassClipInPassSpace,
++             base::FEATURE_DISABLED_BY_DEFAULT);
++
+ // If enabled, VideoConferenceMatcher does not lower the display frame rate
+ // while other (non-video) content in the window updates on (nearly) every
+ // display frame or faster than the interval it would pick, e.g. an animating
+diff --git a/components/viz/common/features.h b/components/viz/common/features.h
+--- a/components/viz/common/features.h
++++ b/components/viz/common/features.h
+@@ -73,6 +73,7 @@
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kUseDrmBlackFullscreenOptimization);
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kVideoConferenceMatcherYieldsToAnimation);
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kMergeSurfacesWithIdleCapture);
++VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kTrackRenderPassClipInPassSpace);
+ #if BUILDFLAG(IS_ANDROID)
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(
+     kUseFrameIntervalDeciderAdaptiveFrameRate);
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -292,17 +292,33 @@
+ void UpdateNeedsRedraw(
+     ResolvedPassData& resolved_pass,
+     AggregatedRenderPass* dest_pass,
+-    const std::optional<gfx::Rect> dest_root_target_clip_rect) {
++    const std::optional<gfx::Rect> dest_root_target_clip_rect,
++    const gfx::Transform& pass_to_root_target_transform) {
+   // |dest_root_target_clip_rect| is the bounding box on the root surface where
+   // this render pass can be rendered into. It includes all ancestors' render
+   // pass output rects, RenderPassDrawQuad rect, SurfaceDrawQuad rect, and clip
+   // rects.
+   DCHECK(dest_root_target_clip_rect.has_value());
+ 
++  // Experiment (kTrackRenderPassClipInPassSpace): compare the visible
++  // part of the pass in its own space. In root space a pass that moves (e.g.
++  // a card under a changing transform) always "expands" and is redrawn, even
++  // if it stays entirely visible and its content did not change.
++  gfx::Rect clip_rect = dest_root_target_clip_rect.value();
++  if (base::FeatureList::IsEnabled(
++          features::kTrackRenderPassClipInPassSpace)) {
++    gfx::Transform root_to_pass;
++    if (pass_to_root_target_transform.GetInverse(&root_to_pass)) {
++      clip_rect =
++          cc::MathUtil::ProjectEnclosingClippedRect(root_to_pass, clip_rect);
++      clip_rect.Intersect(resolved_pass.render_pass().output_rect);
++    }
++  }
++
+   // Save the parent_clip_rect from the current frame.
+   auto& current_parent_clip_rect =
+       resolved_pass.current_persistent_data().parent_clip_rect;
+-  current_parent_clip_rect.Union(dest_root_target_clip_rect.value());
++  current_parent_clip_rect.Union(clip_rect);
+ 
+   // Get the parent_clip_rect from the previous frame;
+   auto& previous_parent_clip_rect =
+@@ -1358,7 +1374,8 @@
+       dest_root_target_clip_rect, resolved_pass.render_pass().output_rect,
+       pass_to_dest_root_target_transform);
+ 
+-  UpdateNeedsRedraw(resolved_pass, dest_pass, new_dest_root_target_clip_rect);
++  UpdateNeedsRedraw(resolved_pass, dest_pass, new_dest_root_target_clip_rect,
++                    pass_to_dest_root_target_transform);
+ 
+   size_t quad_index = 0;
+   auto& resolved_draw_quads = resolved_pass.draw_quads();

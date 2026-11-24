@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 16:27:33 +0000
+Subject: [PATCH 15/50] direct route: one copy sync token per display frame, no flush per copy
+
+The keyed blit copies enqueued between two flushes of the display
+compositor's GPU tasks share one sync token, released with the next flush
+(SkiaOutputSurfaceImpl::FlushGpuTasksWithImpl; a later release token on
+the same sequence also releases it). Before, each copy flushed the GPU
+tasks with its own token, splitting the frame's GPU work into one
+scheduler task (and, under Graphite, one recording/submit) per copy.
+---
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.cc b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.cc
+@@ -1043,15 +1043,19 @@
+   }
+ 
+   // Experiment: give a copy into a caller's non-mappable blit
+-  // destination a sync token that is released right after the GPU task that
+-  // writes it, so the caller's readers can wait on it.
+-  gpu::SyncToken copy_release_token;
++  // destination a sync token that is released after the GPU work that writes
++  // it, so the caller's readers can wait on it. All such copies of a display
++  // frame share one token, released with the frame's next flush of GPU tasks
++  // (see FlushGpuTasksWithImpl), so the copies stay in the frame's own GPU
++  // work instead of a flush (and submit) per copy.
+   if (request->has_blit_request() &&
+       !request->blit_request().populates_mappable_shared_image() &&
+       request->wait_for_new_frame_key()) {
+-    copy_release_token = shared_image_interface_->GenNextSyncToken();
+-    copy_release_token.SetVerifyFlush();
+-    request->set_release_sync_token(copy_release_token);
++    if (!pending_copy_release_token_.HasData()) {
++      pending_copy_release_token_ = shared_image_interface_->GenNextSyncToken();
++      pending_copy_release_token_.SetVerifyFlush();
++    }
++    request->set_release_sync_token(pending_copy_release_token_);
+   }
+ 
+   auto callback = base::BindOnce(&SkiaOutputSurfaceImplOnGpu::CopyOutput,
+@@ -1060,9 +1064,6 @@
+                                  std::move(release_callback));
+   EnqueueGpuTask(std::move(callback), std::move(resource_sync_tokens_),
+                  /*make_current=*/true, /*need_framebuffer=*/mailbox.IsZero());
+-  if (copy_release_token.HasData()) {
+-    FlushGpuTasks(SyncMode::kNoWait, copy_release_token);
+-  }
+ }
+ 
+ void SkiaOutputSurfaceImpl::ScheduleOverlays(
+@@ -1407,9 +1408,20 @@
+ void SkiaOutputSurfaceImpl::FlushGpuTasksWithImpl(
+     SyncMode sync_mode,
+     SkiaOutputSurfaceImplOnGpu* impl_on_gpu,
+-    const gpu::SyncToken& release) {
++    const gpu::SyncToken& release_in) {
+   TRACE_EVENT1("viz", "SkiaOutputSurfaceImpl::FlushGpuTasks", "sync_mode",
+                sync_mode);
++
++  // Experiment: release the token shared by this frame's copies with
++  // these tasks. Release counts on the sequence are monotonic, so a later
++  // `release_in` also releases the earlier pending token.
++  gpu::SyncToken release = release_in;
++  if (pending_copy_release_token_.HasData()) {
++    if (!release.HasData()) {
++      release = pending_copy_release_token_;
++    }
++    pending_copy_release_token_.Clear();
++  }
+ 
+   // impl_on_gpu will only be null during initialization. If we need to make
+   // context current, or measure timings then impl_on_gpu must exist.
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl.h b/components/viz/service/display_embedder/skia_output_surface_impl.h
+--- a/components/viz/service/display_embedder/skia_output_surface_impl.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl.h
+@@ -378,6 +378,9 @@
+ 
+   // Sync tokens for resources which are used for the current frame or render
+   // pass.
++  // Experiment: sync token shared by the keyed blit copies enqueued
++  // since the last flush of GPU tasks; released with the next flush.
++  gpu::SyncToken pending_copy_release_token_;
+   std::vector<gpu::SyncToken> resource_sync_tokens_;
+ 
+   const RendererSettings renderer_settings_;

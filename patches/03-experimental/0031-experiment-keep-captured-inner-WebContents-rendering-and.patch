@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 11:28:08 +0000
+Subject: [PATCH 31/50] experiment: keep captured inner WebContents rendering and aggregated while hidden
+
+While an inner WebContents (e.g. a <controlledframe> guest) is being
+captured: keep its current surface referenced from the outermost root
+compositor (ScopedKeepSurfaceAlive, as SurfaceEmbedConnector does), and give
+it its full frame as compositor viewport, so the capture keeps delivering when
+the element is scrolled out, display:none, visibility:hidden or the window is
+minimized. Local experiment.
+---
+diff --git a/content/browser/renderer_host/cross_process_frame_connector.cc b/content/browser/renderer_host/cross_process_frame_connector.cc
+--- a/content/browser/renderer_host/cross_process_frame_connector.cc
++++ b/content/browser/renderer_host/cross_process_frame_connector.cc
+@@ -13,6 +13,7 @@
+ #include "content/browser/renderer_host/frame_tree.h"
+ #include "content/browser/renderer_host/frame_tree_node.h"
+ #include "content/browser/renderer_host/render_frame_host_delegate.h"
++#include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/renderer_host/render_frame_host_manager.h"
+ #include "content/browser/renderer_host/render_frame_proxy_host.h"
+ #include "content/browser/renderer_host/render_view_host_impl.h"
+@@ -20,12 +21,14 @@
+ #include "content/browser/renderer_host/render_widget_host_impl.h"
+ #include "content/browser/renderer_host/render_widget_host_view_base.h"
+ #include "content/browser/renderer_host/render_widget_host_view_child_frame.h"
++#include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/common/features.h"
+ #include "third_party/blink/public/common/frame/frame_visual_properties.h"
+ #include "third_party/blink/public/common/input/web_input_event.h"
+ #include "third_party/blink/public/mojom/frame/intrinsic_sizing_info.mojom.h"
+ #include "third_party/perfetto/include/perfetto/tracing/track_event_args.h"
+ #include "ui/base/cursor/cursor.h"
++#include "ui/compositor/compositor.h"
+ #include "ui/gfx/geometry/dip_util.h"
+ 
+ namespace content {
+@@ -52,4 +55,37 @@
+                       ->GetScreenInfos();
++}
++
++namespace {
++const char kInnerSurfaceKeepAliveKey[] = "inner_surface_keep_alive_for_capture";
++struct InnerSurfaceKeepAlive : public base::SupportsUserData::Data {
++  base::ScopedClosureRunner runner;
++};
++}  // namespace
++
++// static
++void CrossProcessFrameConnector::UpdateInnerSurfaceKeepAliveForCapture(
++    WebContentsImpl* web_contents) {
++  web_contents->RemoveUserData(kInnerSurfaceKeepAliveKey);
++  if (!web_contents->IsBeingCaptured() ||
++      !web_contents->GetOuterWebContents() ||
++      web_contents->IsBeingDestroyed()) {
++    return;
++  }
++  auto* view = static_cast<RenderWidgetHostViewBase*>(
++      web_contents->GetRenderWidgetHostView());
++  auto* root_view = static_cast<RenderWidgetHostViewBase*>(
++      web_contents->GetOutermostWebContents()->GetRenderWidgetHostView());
++  if (!view || !root_view) {
++    return;
++  }
++  const viz::SurfaceId surface_id = view->GetCurrentSurfaceId();
++  ui::Compositor* compositor = root_view->GetCompositor();
++  if (!surface_id.is_valid() || !compositor) {
++    return;
++  }
++  auto data = std::make_unique<InnerSurfaceKeepAlive>();
++  data->runner = compositor->TakeScopedKeepSurfaceAliveCallback(surface_id);
++  web_contents->SetUserData(kInnerSurfaceKeepAliveKey, std::move(data));
+ }
+ 
+ CrossProcessFrameConnector::~CrossProcessFrameConnector() {
+@@ -221,15 +257,32 @@
+   render_widget_host->SetAutoResize(visual_properties.auto_resize_enabled,
+                                     visual_properties.min_size_for_auto_resize,
+                                     visual_properties.max_size_for_auto_resize);
++  // Experiment: a captured inner WebContents (e.g. a guest) rasters its whole
++  // frame, not only the part that intersects the embedder's viewport, so the
++  // capture keeps receiving content while the element is scrolled out.
++  gfx::Rect compositor_viewport = visual_properties.compositor_viewport;
++  RenderFrameHostImpl* child_main = current_child_frame_host();
++  if (child_main && !child_main->GetParent() &&
++      WebContentsImpl::FromRenderFrameHostImpl(child_main)->IsBeingCaptured()) {
++    compositor_viewport = gfx::Rect(visual_properties.local_frame_size);
++  }
+   render_widget_host->SetVisualPropertiesFromParentFrame(
+       visual_properties.page_scale_factor,
+       visual_properties.compositing_scale_factor,
+       visual_properties.is_pinch_gesture_active,
+       visual_properties.visible_viewport_size,
+-      visual_properties.compositor_viewport,
++      compositor_viewport,
+       visual_properties.root_widget_viewport_segments);
+ 
+   render_widget_host->UpdateVisualProperties(propagate);
++
++  // The main frame of an inner WebContents may have a new surface id; if that
++  // WebContents is being captured, keep the new surface alive instead.
++  RenderFrameHostImpl* child = current_child_frame_host();
++  if (child && !child->GetParent()) {
++    UpdateInnerSurfaceKeepAliveForCapture(
++        WebContentsImpl::FromRenderFrameHostImpl(child));
++  }
+ }
+ 
+ input::RenderWidgetHostViewInput*
+diff --git a/content/browser/renderer_host/cross_process_frame_connector.h b/content/browser/renderer_host/cross_process_frame_connector.h
+--- a/content/browser/renderer_host/cross_process_frame_connector.h
++++ b/content/browser/renderer_host/cross_process_frame_connector.h
+@@ -44,6 +44,7 @@
+ class RenderFrameProxyHost;
+ class RenderWidgetHostViewBase;
+ class RenderWidgetHostViewChildFrame;
++class WebContentsImpl;
+ 
+ // CrossProcessFrameConnector provides the platform view abstraction for
+ // RenderWidgetHostViewChildFrame allowing RWHVChildFrame to remain ignorant
+@@ -93,5 +94,13 @@
+ 
+   ~CrossProcessFrameConnector() override;
++
++  // Experiment: while an inner WebContents (e.g. a <controlledframe> guest)
++  // is being captured, keep its current surface referenced from the outermost
++  // root compositor, so that Viz aggregates it for the capturer's
++  // CopyOutputRequests even when the embedder does not draw it (scrolled out,
++  // display:none, ...). Called when the capturer count or the surface changes.
++  static void UpdateInnerSurfaceKeepAliveForCapture(
++      WebContentsImpl* web_contents);
+ 
+   // |view| corresponds to B2's RenderWidgetHostViewChildFrame in the example
+   // above.
+diff --git a/content/browser/web_contents/web_contents_impl.cc b/content/browser/web_contents/web_contents_impl.cc
+--- a/content/browser/web_contents/web_contents_impl.cc
++++ b/content/browser/web_contents/web_contents_impl.cc
+@@ -2903,6 +2903,7 @@
+   if (surface_embed_connector_) {
+     surface_embed_connector_->UpdateKeepSurfaceAlive();
+   }
++  CrossProcessFrameConnector::UpdateInnerSurfaceKeepAliveForCapture(this);
+ }
+ 
+ #if BUILDFLAG(IS_MAC) && BUILDFLAG(USE_EXTERNAL_POPUP_MENU)

@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 16:55:03 +0000
+Subject: [PATCH 37/50] experiment: no mip chain for copy-output downscales down to 0.5
+
+SkiaOutputSurfaceImplOnGpu::RenderSurface sampled downscaled copies with
+SkMipmapMode::kLinear, so every copy smaller than its source built a mip
+chain of the whole source (direct route at N = 32: 320x180 copies 37.9
+fps/page vs 57.8 for 1:1). Use plain bilinear down to a scale of 0.5 and
+mipmaps only below that.
+---
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -1156,9 +1156,17 @@
+     dest_canvas->clear(SK_ColorTRANSPARENT);
+   }
+ 
++  // Experiment: mipmapped sampling makes Skia build a mip chain of
++  // the whole source for every copy; bilinear sampling is adequate down to
++  // a scale of 0.5 (at exactly 2:1 it averages 2x2 texels), so use mipmaps
++  // only below that.
++  const bool needs_mipmaps =
++      scaling.has_value() && (scaling->x() < 0.5f || scaling->y() < 0.5f);
+   auto sampling =
+       is_downscale_or_identity_in_both_dimensions
+-          ? SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear)
++          ? SkSamplingOptions(SkFilterMode::kLinear,
++                              needs_mipmaps ? SkMipmapMode::kLinear
++                                            : SkMipmapMode::kNone)
+           : SkSamplingOptions({1.0f / 3, 1.0f / 3});
+   surface->draw(dest_canvas, -source_selection.x(), -source_selection.y(),
+                 sampling, /*paint=*/nullptr);

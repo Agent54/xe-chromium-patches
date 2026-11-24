@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 13:30:43 +0000
+Subject: [PATCH 34/50] experiment: content capture into ARGB GPU frames (ContentCaptureLetCapturerPickFormat:format/argb)
+
+Blink requests PIXEL_FORMAT_ARGB instead of UNKNOWN when the feature param
+format=argb is set; the renderer imports ARGB GpuMemoryBuffer frames as a
+BGRA shared image instead of assuming NV12.
+---
+diff --git a/third_party/blink/renderer/modules/mediastream/media_stream_constraints_util_video_content.cc b/third_party/blink/renderer/modules/mediastream/media_stream_constraints_util_video_content.cc
+--- a/third_party/blink/renderer/modules/mediastream/media_stream_constraints_util_video_content.cc
++++ b/third_party/blink/renderer/modules/mediastream/media_stream_constraints_util_video_content.cc
+@@ -9,6 +9,7 @@
+ #include <utility>
+ 
+ #include "base/feature_list.h"
++#include "base/metrics/field_trial_params.h"
+ #include "media/base/limits.h"
+ #include "media/base/video_types.h"
+ #include "third_party/blink/public/common/features.h"
+@@ -52,6 +53,10 @@
+ // picks NV12 (GPU shared image) when it can, instead of always I420.
+ BASE_FEATURE(kContentCaptureLetCapturerPickFormat,
+              base::FEATURE_DISABLED_BY_DEFAULT);
++// "argb": request ARGB (BGRA in a GPU buffer with the shared-image pool)
++// instead of letting the device pick (NV12).
++const base::FeatureParam<std::string> kContentCaptureFormatParam{
++    &kContentCaptureLetCapturerPickFormat, "format", ""};
+ 
+ using ResolutionSet = media_constraints::ResolutionSet;
+ using Point = ResolutionSet::Point;
+@@ -221,7 +226,9 @@
+   params.requested_format = media::VideoCaptureFormat(
+       ToGfxSize(requested_resolution), static_cast<float>(requested_frame_rate),
+       base::FeatureList::IsEnabled(kContentCaptureLetCapturerPickFormat)
+-          ? media::PIXEL_FORMAT_UNKNOWN
++          ? (kContentCaptureFormatParam.Get() == "argb"
++                 ? media::PIXEL_FORMAT_ARGB
++                 : media::PIXEL_FORMAT_UNKNOWN)
+           : media::PIXEL_FORMAT_I420);
+   params.resolution_change_policy = SelectResolutionPolicyFromCandidates(
+       candidates.resolution_set(), default_resolution_policy);
+diff --git a/third_party/blink/renderer/platform/video_capture/video_capture_impl.cc b/third_party/blink/renderer/platform/video_capture/video_capture_impl.cc
+--- a/third_party/blink/renderer/platform/video_capture/video_capture_impl.cc
++++ b/third_party/blink/renderer/platform/video_capture/video_capture_impl.cc
+@@ -787,8 +787,11 @@
+     VideoFrameInitData& video_frame_init_data,
+     base::OnceCallback<void()> on_gmb_not_supported) {
+   DCHECK(gpu_factories);
+-  DCHECK_EQ(video_frame_init_data.ready_buffer->info->pixel_format,
+-            media::PIXEL_FORMAT_NV12);
++  // Experiment: ARGB (BGRA) GPU frames are accepted too.
++  const bool is_argb = video_frame_init_data.ready_buffer->info->pixel_format ==
++                       media::PIXEL_FORMAT_ARGB;
++  DCHECK(is_argb || video_frame_init_data.ready_buffer->info->pixel_format ==
++                        media::PIXEL_FORMAT_NV12);
+ 
+   bool should_recreate_shared_image = false;
+   if (gpu_factories != video_frame_init_data.buffer_context->gpu_factories()) {
+@@ -822,8 +825,8 @@
+       video_frame_init_data.buffer_context->gpu_factories()
+           ->VideoFrameOutputFormat(
+               video_frame_init_data.ready_buffer->info->pixel_format);
+-  DCHECK(output_format ==
+-         media::GpuVideoAcceleratorFactories::OutputFormat::NV12);
++  DCHECK(is_argb || output_format ==
++                        media::GpuVideoAcceleratorFactories::OutputFormat::NV12);
+ 
+   auto size = gfx::Size(video_frame_init_data.ready_buffer->info->coded_size);
+   auto color_space = video_frame_init_data.ready_buffer->info->color_space;
+@@ -846,6 +849,9 @@
+ #if BUILDFLAG(IS_OZONE)
+     multiplanar_si_format.SetPrefersExternalSampler();
+ #endif
++    if (is_argb) {
++      multiplanar_si_format = viz::SinglePlaneFormat::kBGRA_8888;
++    }
+     // The SharedImages here are used to back VideoFrames. They may be read by
+     // the raster interface for format conversion (e.g., for 2-copy import into
+     // WebGL) as well as by the GLES2 interface for one-copy import into WebGL.

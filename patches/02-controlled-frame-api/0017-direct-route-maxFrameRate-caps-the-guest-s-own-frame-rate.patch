@@ -1,0 +1,296 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 16:57:01 +0000
+Subject: [PATCH 17/50] direct route: maxFrameRate caps the guest's own frame rate
+
+- content::SetFrameSinkIntervalForRequester: per frame sink, every
+  requester (the embedder's setFrameRate(), each GuestFrameTextureSource)
+  keeps its own requested BeginFrame interval; the longest (lowest rate)
+  is applied; clearing one restores the others.
+- CreateSource(max_frame_rate): a source with a maxFrameRate requests
+  that interval for its guest while alive (combined with back-pressure:
+  the lower rate wins), so a cap means fewer guest frames and one copy per
+  guest frame. Blink no longer gates requests by time (that under-delivered
+  under load: 30 -> 19.9 at N = 32).
+---
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -1681,6 +1681,8 @@
+     "renderer_host/frame_tree.cc",
+     "renderer_host/frame_tree.h",
+     "renderer_host/frame_tree_node.cc",
++    "renderer_host/frame_sink_interval_registry.cc",
++    "renderer_host/frame_sink_interval_registry.h",
+     "renderer_host/guest_frame_texture_host.cc",
+     "renderer_host/guest_frame_texture_host.h",
+     "renderer_host/frame_tree_node.h",
+diff --git a/content/browser/performance_manager/frame_rate_throttling.cc b/content/browser/performance_manager/frame_rate_throttling.cc
+--- a/content/browser/performance_manager/frame_rate_throttling.cc
++++ b/content/browser/performance_manager/frame_rate_throttling.cc
+@@ -9,6 +9,7 @@
+ #include "components/viz/common/surfaces/frame_sink_id.h"
+ #include "components/viz/host/host_frame_sink_manager.h"
+ #include "content/browser/compositor/surface_utils.h"
++#include "content/browser/renderer_host/frame_sink_interval_registry.h"
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/renderer_host/render_widget_host_impl.h"
+ #include "content/public/browser/browser_thread.h"
+@@ -59,8 +60,12 @@
+   if (!rwh || !GetHostFrameSinkManager()) {
+     return;
+   }
+-  GetHostFrameSinkManager()->SetFrameSinkThrottleInterval(
+-      static_cast<RenderWidgetHostImpl*>(rwh)->GetFrameSinkId(), interval);
++  // The embedder's request; combined with GuestFrameTextureSource requests
++  // (the lowest rate wins).
++  static const char kEmbedderRequester = 0;
++  SetFrameSinkIntervalForRequester(
++      static_cast<RenderWidgetHostImpl*>(rwh)->GetFrameSinkId(),
++      &kEmbedderRequester, interval);
+ }
+ 
+ }  // namespace content
+diff --git a/content/browser/renderer_host/frame_sink_interval_registry.cc b/content/browser/renderer_host/frame_sink_interval_registry.cc
+new file mode 100644
+--- /dev/null
++++ b/content/browser/renderer_host/frame_sink_interval_registry.cc
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/renderer_host/frame_sink_interval_registry.h"
++
++#include <map>
++
++#include "base/no_destructor.h"
++#include "components/viz/host/host_frame_sink_manager.h"
++#include "content/browser/compositor/surface_utils.h"
++#include "content/public/browser/browser_thread.h"
++
++namespace content {
++
++void SetFrameSinkIntervalForRequester(const viz::FrameSinkId& frame_sink_id,
++                                      const void* requester,
++                                      base::TimeDelta interval) {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  static base::NoDestructor<
++      std::map<viz::FrameSinkId, std::map<const void*, base::TimeDelta>>>
++      requests;
++  if (!frame_sink_id.is_valid()) {
++    return;
++  }
++  auto& per_sink = (*requests)[frame_sink_id];
++  if (interval.is_positive()) {
++    per_sink[requester] = interval;
++  } else {
++    per_sink.erase(requester);
++  }
++  base::TimeDelta effective;
++  for (const auto& [unused, requested] : per_sink) {
++    effective = std::max(effective, requested);
++  }
++  if (per_sink.empty()) {
++    requests->erase(frame_sink_id);
++  }
++  if (auto* manager = GetHostFrameSinkManager()) {
++    manager->SetFrameSinkThrottleInterval(frame_sink_id, effective);
++  }
++}
++
++}  // namespace content
+diff --git a/content/browser/renderer_host/frame_sink_interval_registry.h b/content/browser/renderer_host/frame_sink_interval_registry.h
+new file mode 100644
+--- /dev/null
++++ b/content/browser/renderer_host/frame_sink_interval_registry.h
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_RENDERER_HOST_FRAME_SINK_INTERVAL_REGISTRY_H_
++#define CONTENT_BROWSER_RENDERER_HOST_FRAME_SINK_INTERVAL_REGISTRY_H_
++
++#include "base/time/time.h"
++#include "components/viz/common/surfaces/frame_sink_id.h"
++#include "content/common/content_export.h"
++
++namespace content {
++
++// Experiment. Several requesters may ask for a frame sink's
++// BeginFrame interval (the embedder through setFrameRate(), each
++// GuestFrameTextureSource through maxFrameRate / back-pressure). The longest
++// interval (the lowest rate) wins; a requester clearing its interval (zero)
++// restores what the others asked for. Applied with
++// HostFrameSinkManager::SetFrameSinkThrottleInterval. UI thread only.
++CONTENT_EXPORT void SetFrameSinkIntervalForRequester(
++    const viz::FrameSinkId& frame_sink_id,
++    const void* requester,
++    base::TimeDelta interval);
++
++}  // namespace content
++
++#endif  // CONTENT_BROWSER_RENDERER_HOST_FRAME_SINK_INTERVAL_REGISTRY_H_
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+--- a/content/browser/renderer_host/guest_frame_texture_host.cc
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -22,6 +22,7 @@
+ #include "components/viz/host/host_frame_sink_manager.h"
+ #include "content/browser/compositor/image_transport_factory.h"
+ #include "content/browser/compositor/surface_utils.h"
++#include "content/browser/renderer_host/frame_sink_interval_registry.h"
+ #include "content/browser/renderer_host/frame_tree_node.h"
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/renderer_host/render_frame_proxy_host.h"
+@@ -56,14 +57,21 @@
+       scoped_refptr<viz::RasterContextProvider> context_provider,
+       std::vector<scoped_refptr<gpu::ClientSharedImage>> images,
+       base::ScopedClosureRunner capture_handle,
+-      bool backpressure)
++      bool backpressure,
++      double max_frame_rate)
+       : host_(std::move(host)),
+         guest_frame_(guest_frame),
+         size_(size),
+         context_provider_(std::move(context_provider)),
+         images_(std::move(images)),
+-        capture_handle_(std::move(capture_handle)) {
+-    if (backpressure) {
++        capture_handle_(std::move(capture_handle)),
++        backpressure_(backpressure),
++        cap_interval_(max_frame_rate > 0
++                          ? base::Seconds(1.0 / max_frame_rate)
++                          : base::TimeDelta()) {
++    SetGuestInterval(base::TimeDelta());
++    if (backpressure_ || cap_interval_.is_positive()) {
++      // Also re-applies the cap if the guest's frame sink changes.
+       backpressure_timer_.Start(
+           FROM_HERE, kBackpressurePeriod,
+           base::BindRepeating(&GuestFrameTextureSourceHostImpl::UpdateBackpressure,
+@@ -72,6 +80,7 @@
+   }
+ 
+   ~GuestFrameTextureSourceHostImpl() override {
++    cap_interval_ = base::TimeDelta();
+     SetGuestInterval(base::TimeDelta());
+     // The renderer holds its own imported references; ours go away here.
+     gpu::SyncToken token = context_provider_->SharedImageInterface()
+@@ -158,27 +167,35 @@
+   void UpdateBackpressure() {
+     const double rate = requests_in_period_ / kBackpressurePeriod.InSecondsF();
+     requests_in_period_ = 0;
++    if (!backpressure_) {
++      SetGuestInterval(base::TimeDelta());
++      return;
++    }
+     const double target = std::max(5.0, rate * 1.5);
+     SetGuestInterval(base::Seconds(1.0 / target));
+   }
+ 
+-  void SetGuestInterval(base::TimeDelta interval) {
++  // Applies max(`interval`, the maxFrameRate cap) as this source's request
++  // for the guest's frame interval (zero = none); the registry combines it
++  // with other requesters (embedder setFrameRate(), other sources).
++  void SetGuestInterval(base::TimeDelta requested) {
++    const base::TimeDelta interval = std::max(requested, cap_interval_);
+     RenderWidgetHostViewChildFrame* view =
+         host_ ? host_->FindOwnedGuestView(guest_frame_) : nullptr;
+     const viz::FrameSinkId sink =
+         view ? view->GetFrameSinkId() : viz::FrameSinkId();
+     if (throttled_sink_.is_valid() && throttled_sink_ != sink) {
+-      GetHostFrameSinkManager()->SetFrameSinkThrottleInterval(
+-          throttled_sink_, base::TimeDelta());
++      SetFrameSinkIntervalForRequester(throttled_sink_, this,
++                                       base::TimeDelta());
+       throttled_sink_ = viz::FrameSinkId();
+     }
+-    if (!sink.is_valid() || !GetHostFrameSinkManager()) {
++    if (!sink.is_valid()) {
+       return;
+     }
+     if (interval.is_zero() && !throttled_sink_.is_valid()) {
+       return;
+     }
+-    GetHostFrameSinkManager()->SetFrameSinkThrottleInterval(sink, interval);
++    SetFrameSinkIntervalForRequester(sink, this, interval);
+     throttled_sink_ = interval.is_zero() ? viz::FrameSinkId() : sink;
+   }
+ 
+@@ -195,6 +212,8 @@
+   scoped_refptr<viz::RasterContextProvider> context_provider_;
+   std::vector<scoped_refptr<gpu::ClientSharedImage>> images_;
+   base::ScopedClosureRunner capture_handle_;
++  const bool backpressure_ = false;
++  base::TimeDelta cap_interval_;
+   base::WeakPtrFactory<GuestFrameTextureSourceHostImpl> weak_factory_{this};
+ };
+ 
+@@ -283,6 +302,7 @@
+     uint32_t pool_size,
+     bool webgpu,
+     bool backpressure,
++    double max_frame_rate,
+     mojo::PendingReceiver<blink::mojom::GuestFrameTextureSourceHost> source,
+     CreateSourceCallback callback) {
+   auto refuse = [&]() {
+@@ -343,7 +363,7 @@
+   sources_.Add(std::make_unique<GuestFrameTextureSourceHostImpl>(
+                    weak_factory_.GetWeakPtr(), guest_frame, size,
+                    std::move(context_provider), std::move(images),
+-                   std::move(capture_handle), backpressure),
++                   std::move(capture_handle), backpressure, max_frame_rate),
+                std::move(source));
+   std::move(callback).Run(std::move(exported), creation_token);
+ }
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.h b/content/browser/renderer_host/guest_frame_texture_host.h
+--- a/content/browser/renderer_host/guest_frame_texture_host.h
++++ b/content/browser/renderer_host/guest_frame_texture_host.h
+@@ -43,6 +43,7 @@
+       uint32_t pool_size,
+       bool webgpu,
+       bool backpressure,
++      double max_frame_rate,
+       mojo::PendingReceiver<blink::mojom::GuestFrameTextureSourceHost> source,
+       CreateSourceCallback callback) override;
+ 
+diff --git a/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom b/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
+--- a/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
++++ b/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
+@@ -24,8 +24,12 @@
+   // If `backpressure`, the guest's frame rate is held near the rate at which
+   // this source requests copies (i.e. consumes frames), and released when
+   // the source goes away.
++  // `max_frame_rate` (if > 0) also caps the guest's own frame rate while the
++  // source is alive (combined with the embedder's setFrameRate(): the lowest
++  // rate wins), so there is one copy per guest frame and fewer guest frames.
+   CreateSource(RemoteFrameToken guest_frame, gfx.mojom.Size size,
+                uint32 pool_size, bool webgpu, bool backpressure,
++               double max_frame_rate,
+                pending_receiver<GuestFrameTextureSourceHost> source)
+       => (array<gpu.mojom.ExportedSharedImage> images,
+           gpu.mojom.SyncToken creation_sync_token);
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+@@ -78,15 +78,16 @@
+       pool_size_(init->poolSize()),
+       max_in_flight_(init->maxInFlight()),
+       fixed_depth_(std::min(init->pipelineDepth(), init->maxInFlight())),
+-      min_interval_(init->maxFrameRate() > 0
+-                        ? base::Seconds(1.0 / init->maxFrameRate())
+-                        : base::TimeDelta()) {
++      // maxFrameRate is applied to the guest's own frame rate by the browser
++      // (one copy per guest frame); no request gating here.
++      min_interval_() {
+   auto task_runner = context->GetTaskRunner(TaskType::kInternalMedia);
+   context->GetBrowserInterfaceBroker().GetInterface(
+       host_.BindNewPipeAndPassReceiver(task_runner));
+   host_->CreateSource(
+       token_, gfx::Size(width_, height_), pool_size_, init->webgpu(),
+-      init->backpressure(), source_.BindNewPipeAndPassReceiver(task_runner),
++      init->backpressure(), init->maxFrameRate(),
++      source_.BindNewPipeAndPassReceiver(task_runner),
+       blink::BindOnce(&GuestFrameTextureSource::OnSourceCreated,
+                       WrapWeakPersistent(this)));
+   source_.set_disconnect_handler(blink::BindOnce(

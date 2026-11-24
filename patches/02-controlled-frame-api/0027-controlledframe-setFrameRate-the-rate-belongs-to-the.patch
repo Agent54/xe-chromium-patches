@@ -1,0 +1,350 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 20:18:03 +0000
+Subject: [PATCH 27/50] controlledframe.setFrameRate(): the rate belongs to the guest, not to a frame sink
+
+setFrameRate() set an interval on the frame sink of the guest's main frame
+widget at the time of the call; after a navigation to another process the
+guest had a new, unthrottled sink. content::SetRenderWidgetHostFrameInterval
+is replaced by content::SetGuestFrameInterval(guest WebContents, interval):
+the interval is kept as WebContentsUserData on the guest and re-applied to
+the current main frame's frame sink (and cleared from the previous one) on
+RenderFrameHostChanged for the primary main frame and on
+PrimaryPageChanged. It is still one requester in the per-sink registry
+(longest interval wins), so it composes with sources' maxFrameRate and
+back-pressure as before.
+
+Viz: FrameSinkManagerImpl::UpdateThrottlingRecursively(), which runs when a
+sink registers, reset the subtree to the default interval and did not
+re-apply explicit intervals, so a sink registered after its interval was set
+(or a new child, e.g. an OOPIF of a throttled guest) ran unthrottled until
+the next full update. Explicit intervals are now re-applied there too
+(ApplyExplicitThrottleIntervals()).
+
+Test: ControlledFrameTextureSourceTest.SetFrameRateFollowsNavigation
+(setFrameRate(10): guest rAF < 14/s, also after a cross-site navigation to
+another process; setFrameRate(0): > 25/s). With the other
+ControlledFrameTextureSourceTest tests and CaptureStream: 30/30 with
+--gtest_repeat=5.
+---
+diff --git a/chrome/browser/controlled_frame/controlled_frame_apitest.cc b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+--- a/chrome/browser/controlled_frame/controlled_frame_apitest.cc
++++ b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+@@ -1190,6 +1190,121 @@
+   ASSERT_TRUE(content::ExecJs(app_frame, "src.close();"));
+ }
+ 
++// setFrameRate() belongs to the guest element: it still holds after the
++// guest navigates to another site (another process, another frame sink), and
++// setFrameRate(0) clears it.
++IN_PROC_BROWSER_TEST_F(ControlledFrameTextureSourceTest,
++                       SetFrameRateFollowsNavigation) {
++  web_app::IsolatedWebAppUrlInfo url_info =
++      CreateAndInstallEmptyApp(web_app::ManifestBuilder());
++  content::RenderFrameHost* app_frame = OpenApp(url_info.app_id());
++  extensions::WebViewGuest* guest = CreateSizedFrame(
++      app_frame, embedded_https_test_server().GetURL("/index.html"));
++  ASSERT_TRUE(guest);
++  // requestAnimationFrame callbacks per second in the guest, over 1.5 s.
++  constexpr char kRafRate[] = R"(
++    new Promise(resolve => {
++      let n = 0, t0 = 0;
++      (function f(t) {
++        if (!t0) t0 = t;
++        else n++;
++        if (t - t0 < 1500) requestAnimationFrame(f);
++        else resolve(n / ((t - t0) / 1000));
++      })(0);
++    });)";
++  auto set_rate = [&](int fps) {
++    return content::ExecJs(
++        app_frame,
++        content::JsReplace(
++            "document.querySelector('controlledframe').setFrameRate($1)", fps));
++  };
++  const double full = content::EvalJs(guest->GetGuestMainFrame(), kRafRate)
++                          .ExtractDouble();
++  ASSERT_GT(full, 25);
++  ASSERT_TRUE(set_rate(10));
++  EXPECT_LT(content::EvalJs(guest->GetGuestMainFrame(), kRafRate)
++                .ExtractDouble(),
++            14);
++
++  const GURL cross_site =
++      embedded_https_test_server().GetURL("cross.test", "/index.html");
++  content::RenderProcessHost* old_process =
++      guest->GetGuestMainFrame()->GetProcess();
++  ASSERT_TRUE(content::ExecJs(app_frame, content::JsReplace(R"(
++    new Promise(r => {
++      const f = document.querySelector('controlledframe');
++      f.addEventListener('loadstop', r, {once: true});
++      f.src = $1;
++    });)",
++                                                            cross_site)));
++  content::RenderFrameHost* new_main =
++      GetWebViewGuest(app_frame)->GetGuestMainFrame();
++  ASSERT_EQ(cross_site, new_main->GetLastCommittedURL());
++  EXPECT_NE(old_process, new_main->GetProcess());
++  EXPECT_LT(content::EvalJs(new_main, kRafRate).ExtractDouble(), 14);
++
++  ASSERT_TRUE(set_rate(0));
++  EXPECT_GT(content::EvalJs(new_main, kRafRate).ExtractDouble(), 25);
++}
++
++// The methods these patches add never throw: with no guest (not attached,
++// not created yet, destroyed) each returns a rejected promise.
++IN_PROC_BROWSER_TEST_F(ControlledFrameTextureSourceTest, NoGuestRejects) {
++  web_app::IsolatedWebAppUrlInfo url_info =
++      CreateAndInstallEmptyApp(web_app::ManifestBuilder());
++  content::RenderFrameHost* app_frame = OpenApp(url_info.app_id());
++  ASSERT_TRUE(CreateSizedFrame(
++      app_frame, embedded_https_test_server().GetURL("/index.html")));
++  ASSERT_TRUE(content::ExecJs(app_frame, R"(
++    window.callAll = async (f) => {
++      const out = [];
++      for (const [name, call] of [
++               ['setFrameRate', () => f.setFrameRate(10)],
++               ['captureStream', () => f.captureStream()],
++               ['createTextureSource',
++                () => f.createTextureSource({width: 32, height: 32})]]) {
++        let p;
++        try {
++          p = call();
++        } catch (e) {
++          out.push(name + ' threw ' + e);
++          continue;
++        }
++        if (!p || typeof p.then !== 'function') {
++          out.push(name + ' returned no promise');
++          continue;
++        }
++        try {
++          await p;
++          out.push(name + ' resolved');
++        } catch (e) {
++          out.push(name + ' rejected');
++        }
++      }
++      return out.join(', ');
++    };
++    window.stale = document.querySelector('controlledframe');
++    stale.remove();)"));
++  guest_view_manager()->WaitForAllGuestsDeleted();
++  constexpr char kAllRejected[] =
++      "setFrameRate rejected, captureStream rejected, "
++      "createTextureSource rejected";
++  // Destroyed guest (element removed).
++  EXPECT_EQ(kAllRejected, content::EvalJs(app_frame, "callAll(stale)"));
++  // Never attached.
++  EXPECT_EQ(kAllRejected,
++            content::EvalJs(
++                app_frame,
++                "callAll(document.createElement('controlledframe'))"));
++  // Attached, guest not created yet (no src).
++  EXPECT_EQ(kAllRejected, content::EvalJs(app_frame, R"(
++    (() => {
++      const f = document.createElement('controlledframe');
++      document.body.appendChild(f);
++      return callAll(f);
++    })())"));
++}
++
+ // A pending read resolves with null when the guest is destroyed or its
+ // renderer crashes, and continues with the new page when the guest navigates
+ // cross-site.
+diff --git a/components/viz/service/frame_sinks/frame_sink_manager_impl.cc b/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
+--- a/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
++++ b/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
+@@ -1290,6 +1290,7 @@
+   bool check_captures = !captured_frame_sink_ids_.empty();
+ 
+   if (!check_throttles && !check_captures) {
++    ApplyExplicitThrottleIntervals();
+     return;
+   }
+ 
+@@ -1326,6 +1327,7 @@
+ 
+   // Apply the identified rules.
+   ApplyThrottlingRules(throttles, captures);
++  ApplyExplicitThrottleIntervals();
+ }
+ 
+ void FrameSinkManagerImpl::Throttle(const std::vector<FrameSinkId>& ids,
+@@ -1402,7 +1404,13 @@
+ 
+   ApplyThrottlingRules(frame_sink_ids_to_throttle_, captured_frame_sink_ids_);
+ 
++  ApplyExplicitThrottleIntervals();
++}
++
++void FrameSinkManagerImpl::ApplyExplicitThrottleIntervals() {
+   // Experiment: explicit per-sink intervals win, also over capture.
++  // Also applied after a subtree update (UpdateThrottlingRecursively), e.g.
++  // when a throttled sink registers late or gets a new child.
+   for (const auto& [root, interval] : explicit_throttle_intervals_) {
+     RecurseChildren(root, [this, interval](const FrameSinkId& frame_sink_id) {
+       if (auto* support = GetFrameSinkForId(frame_sink_id)) {
+diff --git a/components/viz/service/frame_sinks/frame_sink_manager_impl.h b/components/viz/service/frame_sinks/frame_sink_manager_impl.h
+--- a/components/viz/service/frame_sinks/frame_sink_manager_impl.h
++++ b/components/viz/service/frame_sinks/frame_sink_manager_impl.h
+@@ -673,6 +673,7 @@
+ 
+   // Ids of the frame sinks that have been requested to throttle.
+   base::flat_set<FrameSinkId> frame_sink_ids_to_throttle_;
++  void ApplyExplicitThrottleIntervals();
+   // Experiment: per-sink intervals set by SetFrameSinkThrottleInterval.
+   base::flat_map<FrameSinkId, base::TimeDelta> explicit_throttle_intervals_;
+ 
+diff --git a/content/browser/performance_manager/frame_rate_throttling.cc b/content/browser/performance_manager/frame_rate_throttling.cc
+--- a/content/browser/performance_manager/frame_rate_throttling.cc
++++ b/content/browser/performance_manager/frame_rate_throttling.cc
+@@ -13,6 +13,11 @@
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/renderer_host/render_widget_host_impl.h"
+ #include "content/public/browser/browser_thread.h"
++#include "content/public/browser/page.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "content/public/browser/web_contents_user_data.h"
+ 
+ namespace content {
+ 
+@@ -54,18 +59,77 @@
+   GetHostFrameSinkManager()->Throttle(sink_ids_vector, interval);
+ }
+ 
+-CONTENT_EXPORT void SetRenderWidgetHostFrameInterval(RenderWidgetHost* rwh,
+-                                                     base::TimeDelta interval) {
++namespace {
++
++// The embedder's interval for one guest, kept with the guest's WebContents and
++// applied to whichever frame sink its main frame currently has. Combined with
++// GuestFrameTextureSource requests in the registry (the lowest rate wins).
++class GuestFrameInterval : public WebContentsUserData<GuestFrameInterval>,
++                           public WebContentsObserver {
++ public:
++  ~GuestFrameInterval() override { ApplyTo(viz::FrameSinkId()); }
++
++  void Set(base::TimeDelta interval) {
++    interval_ = interval;
++    Apply();
++  }
++
++  // WebContentsObserver:
++  void RenderFrameHostChanged(RenderFrameHost* old_host,
++                              RenderFrameHost* new_host) override {
++    if (new_host && new_host->IsInPrimaryMainFrame()) {
++      Apply();
++    }
++  }
++  void PrimaryPageChanged(Page& page) override { Apply(); }
++  void WebContentsDestroyed() override { ApplyTo(viz::FrameSinkId()); }
++
++ private:
++  friend class WebContentsUserData<GuestFrameInterval>;
++  explicit GuestFrameInterval(WebContents* contents)
++      : WebContentsUserData(*contents), WebContentsObserver(contents) {}
++
++  void Apply() {
++    RenderWidgetHost* rwh =
++        web_contents() ? web_contents()->GetPrimaryMainFrame()
++                             ->GetRenderWidgetHost()
++                       : nullptr;
++    ApplyTo(rwh ? static_cast<RenderWidgetHostImpl*>(rwh)->GetFrameSinkId()
++                : viz::FrameSinkId());
++  }
++
++  void ApplyTo(const viz::FrameSinkId& sink) {
++    if (applied_sink_.is_valid() && applied_sink_ != sink) {
++      SetFrameSinkIntervalForRequester(applied_sink_, this, base::TimeDelta());
++      applied_sink_ = viz::FrameSinkId();
++    }
++    if (!sink.is_valid() || !GetHostFrameSinkManager()) {
++      return;
++    }
++    if (interval_.is_positive() || applied_sink_.is_valid()) {
++      SetFrameSinkIntervalForRequester(sink, this, interval_);
++      applied_sink_ = interval_.is_positive() ? sink : viz::FrameSinkId();
++    }
++  }
++
++  base::TimeDelta interval_;
++  viz::FrameSinkId applied_sink_;
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(GuestFrameInterval);
++
++}  // namespace
++
++CONTENT_EXPORT void SetGuestFrameInterval(WebContents* guest,
++                                          base::TimeDelta interval) {
+   CHECK_CURRENTLY_ON(content::BrowserThread::UI);
+-  if (!rwh || !GetHostFrameSinkManager()) {
++  if (!guest) {
+     return;
+   }
+-  // The embedder's request; combined with GuestFrameTextureSource requests
+-  // (the lowest rate wins).
+-  static const char kEmbedderRequester = 0;
+-  SetFrameSinkIntervalForRequester(
+-      static_cast<RenderWidgetHostImpl*>(rwh)->GetFrameSinkId(),
+-      &kEmbedderRequester, interval);
++  GuestFrameInterval::CreateForWebContents(guest);
++  GuestFrameInterval::FromWebContents(guest)->Set(interval);
+ }
+ 
+ }  // namespace content
+diff --git a/content/public/browser/frame_rate_throttling.h b/content/public/browser/frame_rate_throttling.h
+--- a/content/public/browser/frame_rate_throttling.h
++++ b/content/public/browser/frame_rate_throttling.h
+@@ -52,13 +52,17 @@
+     const std::set<GlobalRenderFrameHostId>& throttle_frames,
+     base::TimeDelta interval);
+ 
+-class RenderWidgetHost;
++class WebContents;
+ 
+-// Experiment: sets the BeginFrame interval of `rwh`'s frame sink and
+-// its descendants (zero clears it), independent of the other throttling
+-// above and of capture.
+-CONTENT_EXPORT void SetRenderWidgetHostFrameInterval(RenderWidgetHost* rwh,
+-                                                     base::TimeDelta interval);
++// Experiment: the embedder's BeginFrame interval for a guest
++// (`guest` is the guest's inner WebContents; zero clears it). It belongs to
++// the guest, not to a frame sink: it applies to the frame sink of the guest's
++// current main frame and its descendants, and moves with the guest when a
++// navigation gives it a new main frame widget (e.g. another process). It is
++// combined with other per-sink requests (the longest interval wins) and is
++// independent of the other throttling above and of capture.
++CONTENT_EXPORT void SetGuestFrameInterval(WebContents* guest,
++                                          base::TimeDelta interval);
+ 
+ }  // namespace content
+ 
+diff --git a/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc b/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
+--- a/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
++++ b/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
+@@ -376,13 +376,14 @@
+   if (!caller || !guest.attached() || guest.owner_rfh() != caller) {
+     return RespondNow(Error("Only the embedder of the guest can set its rate"));
+   }
+-  content::RenderFrameHost* guest_main_frame = guest.GetGuestMainFrame();
+-  if (!guest_main_frame || !guest_main_frame->GetRenderWidgetHost()) {
+-    return RespondNow(Error("The guest has no widget"));
++  if (!guest.web_contents()) {
++    return RespondNow(Error("The guest has no contents"));
+   }
++  // The rate belongs to the guest: it follows the guest's main frame across
++  // navigations to other processes.
+   const double fps = params->frames_per_second;
+-  content::SetRenderWidgetHostFrameInterval(
+-      guest_main_frame->GetRenderWidgetHost(),
++  content::SetGuestFrameInterval(
++      guest.web_contents(),
+       fps > 0 ? base::Seconds(1.0 / fps) : base::TimeDelta());
+   return RespondNow(NoArguments());
+ }

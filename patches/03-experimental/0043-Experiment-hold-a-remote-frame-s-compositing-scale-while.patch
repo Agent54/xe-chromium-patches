@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 23:32:46 +0000
+Subject: [PATCH 43/50] Experiment: hold a remote frame's compositing scale while its transform changes (kHoldCompositingScaleWhileTransforming)
+
+RemoteFrameView::UpdateCompositingScaleFactor(): with
+kHoldCompositingScaleWhileTransforming (disabled by default) a new
+compositing scale - quantized to 2^(1/4) steps if
+kQuantizeRemoteFrameCompositingScale is also on - is applied in neither
+direction while the raw scale keeps changing; it is applied once the raw
+scale has been stable for 150 ms (a delayed re-check on the parent local
+root's kInternalDefault task runner). The first scale a frame gets is
+applied at once. During a zoom the child keeps rastering at its old scale
+(the card is up to one step soft until the zoom has settled) instead of
+re-rastering, with a new surface, at every step.
+---
+diff --git a/third_party/blink/renderer/core/frame/remote_frame_view.cc b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+--- a/third_party/blink/renderer/core/frame/remote_frame_view.cc
++++ b/third_party/blink/renderer/core/frame/remote_frame_view.cc
+@@ -52,6 +52,9 @@
+ // Experiment: see RemoteFrameView::UpdateCompositingRect().
+ BASE_FEATURE(kStableRemoteFrameCompositingRect,
+              base::FEATURE_DISABLED_BY_DEFAULT);
++// Experiment: see RemoteFrameView::UpdateCompositingScaleFactor().
++BASE_FEATURE(kHoldCompositingScaleWhileTransforming,
++             base::FEATURE_DISABLED_BY_DEFAULT);
+ }  // namespace
+ 
+ 
+@@ -345,50 +348,69 @@
+                  kMaxCompositingScaleFactor);
+ 
+   // Experiment: a card under a changing transform (zoom) gets a new
+-  // scale on every frame, and the child re-rasters for each. Quantize to
+-  // steps of 2^(1/4): round up (never below the scale shown), go down only
+-  // when the scale is a full sqrt(2) below the current step and has not
+-  // changed for kSettle (re-checked then).
+-  if (base::FeatureList::IsEnabled(kQuantizeRemoteFrameCompositingScale)) {
++  // scale on every frame, and the child re-rasters for each.
++  // - kQuantizeRemoteFrameCompositingScale: steps of 2^(1/4), rounded up
++  //   (never below the scale shown); without the hold below, a lower step is
++  //   taken only when the scale is a full sqrt(2) below the current one and
++  //   has not changed for 300 ms, a higher one at once.
++  // - kHoldCompositingScaleWhileTransforming: no step in either direction
++  //   while the scale keeps changing; the new scale is applied once it has
++  //   been stable for 150 ms.
++  const bool quantize =
++      base::FeatureList::IsEnabled(kQuantizeRemoteFrameCompositingScale);
++  const bool hold =
++      base::FeatureList::IsEnabled(kHoldCompositingScaleWhileTransforming);
++  if (quantize || hold) {
+     const float raw = compositing_scale_factor_;
+     const base::TimeTicks now = base::TimeTicks::Now();
+     if (raw != raw_compositing_scale_factor_) {
+       raw_compositing_scale_factor_ = raw;
+       raw_scale_changed_at_ = now;
+     }
+-    const float step = std::clamp(
+-        std::exp2(std::ceil(std::log2(raw) * 4.0f - 1e-3f) / 4.0f),
+-        kMinCompositingScaleFactor, kMaxCompositingScaleFactor);
+-    constexpr base::TimeDelta kSettle = base::Milliseconds(300);
+-    float quantized = step;
+-    if (step < previous_scale_factor) {
+-      const bool far_below =
+-          raw <= previous_scale_factor / std::sqrt(2.0f) + 1e-4f;
+-      const bool settled = now - raw_scale_changed_at_ >= kSettle;
+-      if (!far_below) {
+-        quantized = previous_scale_factor;
+-      } else if (!settled) {
+-        quantized = previous_scale_factor;
+-        if (!scale_recheck_pending_) {
+-          scale_recheck_pending_ = true;
+-          local_root_view->GetFrame()
+-              .GetTaskRunner(TaskType::kInternalDefault)
+-              ->PostDelayedTask(
+-                  FROM_HERE,
+-                  BindOnce(
+-                      [](RemoteFrameView* view) {
+-                        if (!view) {
+-                          return;
+-                        }
+-                        view->scale_recheck_pending_ = false;
+-                        view->UpdateCompositingScaleFactor();
+-                      },
+-                      WrapWeakPersistent(this)),
+-                  kSettle);
++    float target = raw;
++    if (quantize) {
++      target = std::clamp(
++          std::exp2(std::ceil(std::log2(raw) * 4.0f - 1e-3f) / 4.0f),
++          kMinCompositingScaleFactor, kMaxCompositingScaleFactor);
++    }
++    float applied = target;
++    std::optional<base::TimeDelta> recheck;
++    if (scale_initialized_ && target != previous_scale_factor) {
++      constexpr base::TimeDelta kHoldSettle = base::Milliseconds(150);
++      constexpr base::TimeDelta kDownSettle = base::Milliseconds(300);
++      const base::TimeDelta stable_for = now - raw_scale_changed_at_;
++      if (hold) {
++        if (stable_for < kHoldSettle) {
++          applied = previous_scale_factor;
++          recheck = kHoldSettle - stable_for;
++        }
++      } else if (quantize && target < previous_scale_factor) {
++        if (raw > previous_scale_factor / std::sqrt(2.0f) + 1e-4f) {
++          applied = previous_scale_factor;
++        } else if (stable_for < kDownSettle) {
++          applied = previous_scale_factor;
++          recheck = kDownSettle - stable_for;
+         }
+       }
+     }
+-    compositing_scale_factor_ = quantized;
++    scale_initialized_ = true;
++    compositing_scale_factor_ = applied;
++    if (recheck && !scale_recheck_pending_) {
++      scale_recheck_pending_ = true;
++      local_root_view->GetFrame()
++          .GetTaskRunner(TaskType::kInternalDefault)
++          ->PostDelayedTask(FROM_HERE,
++                            BindOnce(
++                                [](RemoteFrameView* view) {
++                                  if (!view) {
++                                    return;
++                                  }
++                                  view->scale_recheck_pending_ = false;
++                                  view->UpdateCompositingScaleFactor();
++                                },
++                                WrapWeakPersistent(this)),
++                            *recheck);
++    }
+   }
+ 
+   if (compositing_scale_factor_ != previous_scale_factor)
+diff --git a/third_party/blink/renderer/core/frame/remote_frame_view.h b/third_party/blink/renderer/core/frame/remote_frame_view.h
+--- a/third_party/blink/renderer/core/frame/remote_frame_view.h
++++ b/third_party/blink/renderer/core/frame/remote_frame_view.h
+@@ -129,6 +129,8 @@
+   float raw_compositing_scale_factor_ = 0.0f;
+   base::TimeTicks raw_scale_changed_at_;
+   bool scale_recheck_pending_ = false;
++  bool scale_initialized_ = false;
++
+ 
+   std::optional<NaturalSizingInfo> natural_sizing_info_;
+   bool needs_occlusion_tracking_ = false;

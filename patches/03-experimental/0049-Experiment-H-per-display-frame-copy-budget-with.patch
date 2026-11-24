@@ -1,0 +1,468 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Mon, 23 Nov 2026 01:03:46 +0000
+Subject: [PATCH 49/50] Experiment (H): per-display-frame copy budget with priorities for keyed copies (kKeyedCopyBudget)
+
+API: createTextureSource({priority: 'high' | 'low'}) (default 'high') and
+GuestFrameTextureSource.setPriority(); the browser marks its copy requests
+(new CopyOutputRequest::low_priority, serialized) and
+GuestFrameTextureSourceHost gains SetLowPriority().
+
+Viz: FrameSinkManagerImpl::AdmitKeyedCopy() keeps one budget per display
+frame (identified by the expected display time; kKeyedCopyBudget 'units',
+default 8 units of 640x360 source pixels). High-priority copies are always
+admitted and charged; a low-priority copy is admitted only while budget
+remains, or after waiting 'max_wait_frames' (6) frames (aging). In
+CompositorFrameSinkSupport a parked low-priority request that is not
+admitted stays parked with the sink's latest content as its dirty state; it
+is retried on every drawn frame (OnSurfaceWillDraw), also without new
+damage, and an admitted retry forces a redraw so the copy is taken at the
+next aggregation. Cancellation and cleanup forget the per-key state. Disabled by default.
+Not
+done: feeding sustained deferral back into the guest's BeginFrame interval.
+
+Measured (N = 64 synthetic animating guests, first 8 high priority,
+Release, 2 runs each): budget off / on - scene 24.5 / 27.9 fps, p99 frame
+85 / 78 ms, high group 23.9 / 26.2 fps, low group 23.9 / 25.2 fps, focus
+latency 85 / 73 ms, max card age high 82 / 68 ms, low 82 / 142 ms. The
+GPU main thread stays at 98%: guest raster, not copies, is the load, so a
+copy budget alone does not protect the scene.
+---
+diff --git a/components/viz/common/features.cc b/components/viz/common/features.cc
+--- a/components/viz/common/features.cc
++++ b/components/viz/common/features.cc
+@@ -76,6 +76,15 @@
+ BASE_FEATURE(kTrackRenderPassClipInPassSpace,
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ 
++// Experiment: keyed copy requests marked low priority are admitted
++// against a per-display-frame budget (in units of 640x360 source pixels);
++// waiting ones age and are admitted after kKeyedCopyMaxWaitFrames frames.
++BASE_FEATURE(kKeyedCopyBudget, base::FEATURE_DISABLED_BY_DEFAULT);
++const base::FeatureParam<double> kKeyedCopyBudgetUnits{&kKeyedCopyBudget,
++                                                       "units", 8.0};
++const base::FeatureParam<int> kKeyedCopyMaxWaitFrames{&kKeyedCopyBudget,
++                                                      "max_wait_frames", 6};
++
+ // If enabled, VideoConferenceMatcher does not lower the display frame rate
+ // while other (non-video) content in the window updates on (nearly) every
+ // display frame or faster than the interval it would pick, e.g. an animating
+diff --git a/components/viz/common/features.h b/components/viz/common/features.h
+--- a/components/viz/common/features.h
++++ b/components/viz/common/features.h
+@@ -73,6 +73,9 @@
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kUseDrmBlackFullscreenOptimization);
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kVideoConferenceMatcherYieldsToAnimation);
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kMergeSurfacesWithIdleCapture);
++VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kKeyedCopyBudget);
++VIZ_COMMON_EXPORT extern const base::FeatureParam<double> kKeyedCopyBudgetUnits;
++VIZ_COMMON_EXPORT extern const base::FeatureParam<int> kKeyedCopyMaxWaitFrames;
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(kTrackRenderPassClipInPassSpace);
+ #if BUILDFLAG(IS_ANDROID)
+ VIZ_COMMON_EXPORT BASE_DECLARE_FEATURE(
+diff --git a/components/viz/common/frame_sinks/copy_output_request.h b/components/viz/common/frame_sinks/copy_output_request.h
+--- a/components/viz/common/frame_sinks/copy_output_request.h
++++ b/components/viz/common/frame_sinks/copy_output_request.h
+@@ -164,6 +164,12 @@
+     return wait_for_new_frame_key_;
+   }
+ 
++  // Experiment: a keyed request with low priority is admitted against
++  // a per-display-frame copy budget (kKeyedCopyBudget); high priority (the
++  // default) is always admitted.
++  void set_low_priority(bool low) { low_priority_ = low; }
++  bool low_priority() const { return low_priority_; }
++
+   // Experiment (viz-internal, not serialized): sync token released on
+   // the display compositor's GPU sequence after the copy into a non-mappable
+   // blit destination; returned in the result's sync_token().
+@@ -212,6 +218,7 @@
+ 
+   bool is_secure_ = false;
+   std::optional<base::UnguessableToken> wait_for_new_frame_key_;
++  bool low_priority_ = false;
+   gpu::SyncToken release_sync_token_;
+ };
+ 
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+@@ -376,10 +376,71 @@
+ }
+ 
+ void CompositorFrameSinkSupport::OnSurfaceWillDraw(Surface* surface) {
++  // Experiment (kKeyedCopyBudget): copies deferred for budget are
++  // retried on every drawn frame (also when the sink has no new damage), and
++  // age while they wait.
++  if (!budget_dirty_keys_.empty()) {
++    bool admitted = false;
++    for (auto it = deferred_copy_output_requests_.begin();
++         it != deferred_copy_output_requests_.end();) {
++      const base::UnguessableToken key =
++          *(*it)->copy_output_request->wait_for_new_frame_key();
++      if (!budget_dirty_keys_.contains(key) ||
++          !AdmitKeyedCopy(**it, base::TimeTicks())) {
++        ++it;
++        continue;
++      }
++      last_copied_damage_by_key_[key] = damage_count_;
++      copy_output_requests_.push_back(std::move(*it));
++      it = deferred_copy_output_requests_.erase(it);
++      admitted = true;
++    }
++    if (admitted) {
++      // Taken at the next aggregation; make sure there is one.
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE,
++          base::BindOnce(&CompositorFrameSinkSupport::ForceRedrawForCopy,
++                         weak_factory_.GetWeakPtr()));
++    }
++  }
+   if (last_drawn_frame_index_ >= surface->GetActiveFrameIndex()) {
+     return;
+   }
+   last_drawn_frame_index_ = surface->GetActiveFrameIndex();
++}
++
++bool CompositorFrameSinkSupport::AdmitKeyedCopy(
++    const PendingCopyOutputRequest& request,
++    base::TimeTicks expected_display_time) {
++  const CopyOutputRequest& copy = *request.copy_output_request;
++  const base::UnguessableToken& key = *copy.wait_for_new_frame_key();
++  if (!base::FeatureList::IsEnabled(features::kKeyedCopyBudget)) {
++    return true;
++  }
++  const double cost =
++      copy.has_area() ? static_cast<double>(copy.area().size().Area64()) /
++                            (640.0 * 360.0)
++                      : 1.0;
++  int& waited = budget_waited_[key];
++  if (!frame_sink_manager_->AdmitKeyedCopy(expected_display_time, cost,
++                                           copy.low_priority(), waited)) {
++    ++waited;
++    budget_dirty_keys_.insert(key);
++    return false;
++  }
++  budget_waited_.erase(key);
++  budget_dirty_keys_.erase(key);
++  return true;
++}
++
++void CompositorFrameSinkSupport::ForceRedrawForCopy() {
++  if (last_activated_surface_id_.is_valid()) {
++    BeginFrameAck ack;
++    ack.has_damage = true;
++    surface_manager_->SurfaceModified(
++        last_activated_surface_id_, ack,
++        SurfaceObserver::HandleInteraction::kNoChange);
++  }
+ }
+ 
+ void CompositorFrameSinkSupport::OnFrameTokenChanged(uint32_t frame_token) {
+@@ -417,6 +478,12 @@
+       const base::UnguessableToken& key =
+           *request->copy_output_request->wait_for_new_frame_key();
+       if (released_keys.insert(key).second) {
++        // Experiment (kKeyedCopyBudget): a low-priority copy waits for
++        // budget (keeping the sink's latest content as its dirty state).
++        if (!AdmitKeyedCopy(*request, expected_display_time)) {
++          still_waiting.push_back(std::move(request));
++          continue;
++        }
+         last_copied_damage_by_key_[key] = damage_count_;
+         copy_output_requests_.push_back(std::move(request));
+       } else {
+@@ -1911,6 +1978,8 @@
+   copy_output_requests_.clear();
+   deferred_copy_output_requests_.clear();
+   last_copied_damage_by_key_.clear();
++  budget_waited_.clear();
++  budget_dirty_keys_.clear();
+ }
+ 
+ void CompositorFrameSinkSupport::CancelKeyedCopyOutputRequests(
+@@ -1922,6 +1991,8 @@
+   std::erase_if(deferred_copy_output_requests_, has_key);
+   std::erase_if(copy_output_requests_, has_key);
+   last_copied_damage_by_key_.erase(key);
++  budget_waited_.erase(key);
++  budget_dirty_keys_.erase(key);
+ }
+ 
+ void CompositorFrameSinkSupport::SetLayerContextWantsBeginFrames(
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.h b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.h
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+@@ -469,6 +469,13 @@
+   // per wait key the value at its last copy.
+   uint64_t damage_count_ = 0;
+   base::flat_map<base::UnguessableToken, uint64_t> last_copied_damage_by_key_;
++  // Experiment (kKeyedCopyBudget): per key, frames a dirty copy has
++  // waited for budget, and the keys with such a copy.
++  base::flat_map<base::UnguessableToken, int> budget_waited_;
++  base::flat_set<base::UnguessableToken> budget_dirty_keys_;
++  bool AdmitKeyedCopy(const PendingCopyOutputRequest& request,
++                      base::TimeTicks expected_display_time);
++  void ForceRedrawForCopy();
+ 
+   bool callback_received_begin_frame_ = true;
+   bool callback_received_receive_ack_ = true;
+diff --git a/components/viz/service/frame_sinks/frame_sink_manager_impl.cc b/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
+--- a/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
++++ b/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
+@@ -1411,6 +1411,23 @@
+   ApplyExplicitThrottleIntervals();
+ }
+ 
++bool FrameSinkManagerImpl::AdmitKeyedCopy(base::TimeTicks expected_display_time,
++                                          double cost,
++                                          bool low_priority,
++                                          int waited_frames) {
++  if (!expected_display_time.is_null() &&
++      expected_display_time != keyed_copy_budget_frame_) {
++    keyed_copy_budget_frame_ = expected_display_time;
++    keyed_copy_budget_remaining_ = features::kKeyedCopyBudgetUnits.Get();
++  }
++  if (low_priority && waited_frames < features::kKeyedCopyMaxWaitFrames.Get() &&
++      keyed_copy_budget_remaining_ < cost) {
++    return false;
++  }
++  keyed_copy_budget_remaining_ -= cost;
++  return true;
++}
++
+ void FrameSinkManagerImpl::ApplyExplicitThrottleIntervals() {
+   // Experiment: explicit per-sink intervals win, also over capture.
+   // Also applied after a subtree update (UpdateThrottlingRecursively), e.g.
+diff --git a/components/viz/service/frame_sinks/frame_sink_manager_impl.h b/components/viz/service/frame_sinks/frame_sink_manager_impl.h
+--- a/components/viz/service/frame_sinks/frame_sink_manager_impl.h
++++ b/components/viz/service/frame_sinks/frame_sink_manager_impl.h
+@@ -674,6 +674,21 @@
+   // Ids of the frame sinks that have been requested to throttle.
+   base::flat_set<FrameSinkId> frame_sink_ids_to_throttle_;
+   void ApplyExplicitThrottleIntervals();
++
++ public:
++  // Experiment (kKeyedCopyBudget): one budget per display frame
++  // (identified by its expected display time; a null time means the current
++  // one) for keyed copy requests. High-priority copies are always admitted and
++  // charged; low-priority ones only while budget remains, or after waiting
++  // kKeyedCopyMaxWaitFrames frames.
++  bool AdmitKeyedCopy(base::TimeTicks expected_display_time,
++                      double cost,
++                      bool low_priority,
++                      int waited_frames);
++
++ private:
++  base::TimeTicks keyed_copy_budget_frame_;
++  double keyed_copy_budget_remaining_ = 0;
+   // Experiment: per-sink intervals set by SetFrameSinkThrottleInterval.
+   base::flat_map<FrameSinkId, base::TimeDelta> explicit_throttle_intervals_;
+ 
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+--- a/content/browser/renderer_host/guest_frame_texture_host.cc
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -192,7 +192,8 @@
+       bool backpressure,
+       double max_frame_rate,
+       scoped_refptr<UsageAccount> account,
+-      gpu::SharedImageUsageSet usage)
++      gpu::SharedImageUsageSet usage,
++      bool low_priority)
+       : WebContentsObserver(guest_contents),
+         host_(std::move(host)),
+         guest_frame_(guest_frame),
+@@ -206,6 +207,7 @@
+                           : base::TimeDelta()),
+         account_(std::move(account)),
+         usage_(usage),
++        low_priority_(low_priority),
+         in_flight_(images_.size(), false),
+         release_after_copy_(images_.size()),
+         site_(net::SchemefulSite(guest_contents->GetPrimaryMainFrame()
+@@ -348,6 +350,10 @@
+     }
+   }
+ 
++  void SetLowPriority(bool low_priority) override {
++    low_priority_ = low_priority;
++  }
++
+   void ReleaseSlot(uint32_t index,
+                    const gpu::SyncToken& release_sync_token) override {
+     if (stopped_ && index < images_.size()) {
+@@ -468,6 +474,7 @@
+         images_[index], release_sync_token,
+         /*populates_mappable_shared_image=*/false));
+     request->set_wait_for_new_frame_key(wait_key_);
++    request->set_low_priority(low_priority_);
+     requested_sinks_.insert(view->GetFrameSinkId());
+     GetHostFrameSinkManager()->RequestCopyOfOutput(
+         view->GetCurrentSurfaceId(), std::move(request),
+@@ -609,6 +616,7 @@
+   base::TimeDelta cap_interval_;
+   const scoped_refptr<UsageAccount> account_;
+   const gpu::SharedImageUsageSet usage_;
++  bool low_priority_ = false;
+   // Slots with a copy requested and not replied to.
+   std::vector<bool> in_flight_;
+   // Release tokens for slots given up by Stop()/ReleaseSlot() while a copy
+@@ -750,6 +758,7 @@
+     bool webgpu,
+     bool backpressure,
+     double max_frame_rate,
++    bool low_priority,
+     mojo::PendingReceiver<blink::mojom::GuestFrameTextureSourceHost> source,
+     CreateSourceCallback callback) {
+   auto refuse = [&]() {
+@@ -832,7 +841,7 @@
+                    guest_contents, weak_factory_.GetWeakPtr(), guest_frame, size,
+                    std::move(context_provider), std::move(images),
+                    std::move(capture_handle), backpressure, max_frame_rate,
+-                   account, usage),
++                   account, usage, low_priority),
+                std::move(source));
+   // The source owns the reservation now.
+   std::ignore = unreserve.Release();
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.h b/content/browser/renderer_host/guest_frame_texture_host.h
+--- a/content/browser/renderer_host/guest_frame_texture_host.h
++++ b/content/browser/renderer_host/guest_frame_texture_host.h
+@@ -45,6 +45,7 @@
+       bool webgpu,
+       bool backpressure,
+       double max_frame_rate,
++      bool low_priority,
+       mojo::PendingReceiver<blink::mojom::GuestFrameTextureSourceHost> source,
+       CreateSourceCallback callback) override;
+ 
+diff --git a/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.cc b/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.cc
+--- a/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.cc
++++ b/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.cc
+@@ -166,6 +166,7 @@
+     return base::unexpected(DeserializationError());
+   }
+   request->set_wait_for_new_frame_key(std::move(wait_key));
++  request->set_low_priority(data.low_priority());
+ 
+   *out_p = std::move(request);
+ 
+diff --git a/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.h b/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.h
+--- a/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.h
++++ b/services/viz/public/cpp/compositing/copy_output_request_mojom_traits.h
+@@ -72,6 +72,11 @@
+     return request->wait_for_new_frame_key();
+   }
+ 
++  static bool low_priority(
++      const std::unique_ptr<viz::CopyOutputRequest>& request) {
++    return request->low_priority();
++  }
++
+   static mojo::PendingRemote<viz::mojom::CopyOutputResultSender> result_sender(
+       const std::unique_ptr<viz::CopyOutputRequest>& request);
+ 
+diff --git a/services/viz/public/mojom/compositing/copy_output_request.mojom b/services/viz/public/mojom/compositing/copy_output_request.mojom
+--- a/services/viz/public/mojom/compositing/copy_output_request.mojom
++++ b/services/viz/public/mojom/compositing/copy_output_request.mojom
+@@ -28,6 +28,8 @@
+ 
+   // Experiment: see CopyOutputRequest::wait_for_new_frame_key().
+   mojo_base.mojom.UnguessableToken? wait_for_new_frame_key;
++  // Experiment: see CopyOutputRequest::low_priority().
++  bool low_priority;
+ 
+   pending_remote<CopyOutputResultSender> result_sender;
+ };
+diff --git a/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom b/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
+--- a/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
++++ b/third_party/blink/public/mojom/guest_frame_texture/guest_frame_texture.mojom
+@@ -27,9 +27,11 @@
+   // `max_frame_rate` (if > 0) also caps the guest's own frame rate while the
+   // source is alive (combined with the embedder's setFrameRate(): the lowest
+   // rate wins), so there is one copy per guest frame and fewer guest frames.
++  // `low_priority`: copies wait for the display compositor's per-frame copy
++  // budget (high-priority copies are always made); see SetLowPriority().
+   CreateSource(RemoteFrameToken guest_frame, gfx.mojom.Size size,
+                uint32 pool_size, bool webgpu, bool backpressure,
+-               double max_frame_rate,
++               double max_frame_rate, bool low_priority,
+                pending_receiver<GuestFrameTextureSourceHost> source)
+       => (array<gpu.mojom.ExportedSharedImage> images,
+           gpu.mojom.SyncToken creation_sync_token);
+@@ -66,4 +68,7 @@
+   // ReleaseSlot() as their frames are closed, then closes the pipe.
+   Stop(array<bool> held, array<gpu.mojom.SyncToken> release_sync_tokens);
+   ReleaseSlot(uint32 index, gpu.mojom.SyncToken release_sync_token);
++
++  // Changes the priority of this source's next copies.
++  SetLowPriority(bool low_priority);
+ };
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+@@ -88,7 +88,7 @@
+       host_.BindNewPipeAndPassReceiver(task_runner));
+   host_->CreateSource(
+       token_, gfx::Size(width_, height_), pool_size_, init->webgpu(),
+-      init->backpressure(), init->maxFrameRate(),
++      init->backpressure(), init->maxFrameRate(), init->priority() == "low",
+       source_.BindNewPipeAndPassReceiver(task_runner),
+       blink::BindOnce(&GuestFrameTextureSource::OnSourceCreated,
+                       WrapWeakPersistent(this)));
+@@ -504,6 +504,12 @@
+ void GuestFrameTextureSource::End() {
+   // End of stream (the guest is gone or no longer readable): same as close().
+   close();
++}
++
++void GuestFrameTextureSource::setPriority(const String& priority) {
++  if (source_.is_bound() && !closed_) {
++    source_->SetLowPriority(priority == "low");
++  }
+ }
+ 
+ void GuestFrameTextureSource::close() {
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+@@ -17,6 +17,7 @@
+ #include "third_party/blink/renderer/modules/modules_export.h"
+ #include "third_party/blink/renderer/platform/bindings/script_wrappable.h"
+ #include "third_party/blink/renderer/platform/mojo/heap_mojo_remote.h"
++#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
+ #include "third_party/blink/renderer/platform/wtf/vector.h"
+ 
+ namespace gpu {
+@@ -59,6 +60,7 @@
+ 
+   ScriptPromise<IDLNullable<VideoFrame>> read(ScriptState*, ExceptionState&);
+   void close();
++  void setPriority(const String& priority);
+   uint32_t width() const { return width_; }
+   uint32_t height() const { return height_; }
+ 
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.idl b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.idl
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.idl
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.idl
+@@ -19,6 +19,9 @@
+ 
+   void close();
+ 
++  // "high" or "low" (see GuestFrameTextureSourceInit.priority).
++  void setPriority(DOMString priority);
++
+   readonly attribute unsigned long width;
+   readonly attribute unsigned long height;
+ };
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source_init.idl
+@@ -22,4 +22,8 @@
+   // Hold the guest's own frame rate near the rate at which this source's
+   // frames are read (released when the source is closed or collected).
+   boolean backpressure = false;
++  // "high" (default): a copy for every new guest frame. "low": copies wait
++  // for the display compositor's per-frame copy budget, and age while they
++  // wait (so they are delayed, never starved). Change with setPriority().
++  DOMString priority = "high";
+ };

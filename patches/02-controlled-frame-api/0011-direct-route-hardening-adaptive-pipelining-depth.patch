@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 14:59:42 +0000
+Subject: [PATCH 11/50] direct route hardening: adaptive pipelining depth
+
+One copy in flight, plus one for every two 60 Hz frame intervals that a
+copy takes to come back (smoothed), up to maxInFlight. A fixed depth of 2
+dropped stale copies when the round trip was short (N = 32: 54.5 fps/page
+vs 58.2 with depth 1); with a long round trip (N = 64) it doubles the rate.
+---
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.cc
+@@ -159,10 +159,18 @@
+   }
+   // Keep up to `max_in_flight_` copies going while nothing is waiting to be
+   // read (prefetch), plus one when a read is pending and nothing is ready.
++  // Adaptive depth: one copy in flight, plus one for every two frame
++  // intervals (at 60 Hz) beyond the first that a copy takes to come back
++  // (the round trip includes waiting for the guest's next frame), up to
++  // `max_in_flight_`. With a short round trip a second copy would mostly be
++  // dropped as stale.
++  const wtf_size_t depth = std::clamp<wtf_size_t>(
++      1 + static_cast<wtf_size_t>(copy_round_trip_ / base::Hertz(30)), 1,
++      max_in_flight_);
+   while (true) {
+     const wtf_size_t copying = CountIn(SlotState::kCopying);
+     const wtf_size_t ready = CountIn(SlotState::kReady);
+-    if (copying >= max_in_flight_ || ready > 0) {
++    if (copying >= depth || ready > 0) {
+       return;
+     }
+     auto it = std::ranges::find_if(
+@@ -188,6 +196,7 @@
+     const wtf_size_t index =
+         static_cast<wtf_size_t>(std::distance(slots_.begin(), it));
+     it->state = SlotState::kCopying;
++    it->issued = now;
+     source_->CopyNextFrame(
+         index, it->release_token,
+         blink::BindOnce(&GuestFrameTextureSource::OnCopied,
+@@ -205,6 +214,12 @@
+     End();
+     return;
+   }
++  // Includes the wait for the guest's next frame; that is what decides
++  // whether another copy can be useful meanwhile.
++  const base::TimeDelta rtt = base::TimeTicks::Now() - slot.issued;
++  copy_round_trip_ = copy_round_trip_.is_zero()
++                         ? rtt
++                         : (copy_round_trip_ * 7 + rtt) / 8;
+   slot.state = SlotState::kReady;
+   slot.ready_token = ready_token;
+   slot.sequence = next_sequence_++;
+diff --git a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+--- a/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
++++ b/third_party/blink/renderer/modules/webcodecs/guest_frame_texture_source.h
+@@ -69,6 +69,7 @@
+     gpu::SyncToken release_token;
+     gpu::SyncToken ready_token;
+     uint64_t sequence = 0;
++    base::TimeTicks issued;
+   };
+ 
+   void OnSourceCreated(Vector<gpu::ExportedSharedImage> images,
+@@ -96,6 +97,9 @@
+   bool ended_ = false;
+   bool pump_scheduled_ = false;
+   uint64_t next_sequence_ = 1;
++  // Smoothed time from requesting a copy to receiving it; more copies are
++  // kept in flight only while it is longer than a frame.
++  base::TimeDelta copy_round_trip_;
+   Vector<Slot> slots_;
+   Member<ScriptPromiseResolver<IDLNullable<VideoFrame>>> pending_read_;
+ };

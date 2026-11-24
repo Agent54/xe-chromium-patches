@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 18:38:26 +0000
+Subject: [PATCH 18/50] direct route: authorize guest pixel reads in the browser (Controlled Frame, screenshot policy)
+
+GuestFrameTextureHost's ownership check (the caller's process, exact parent
+frame, outer delegate, inner WebContents for a guest) now also asks the
+embedder through a new ContentBrowserClient::MayReadGuestFramePixels()
+(default false). Chrome allows it only for a guest owned by a Controlled
+Frame embedder, read by that owner frame, with the controlled-frame
+permissions policy feature enabled, and when screenshots are not restricted
+(the IsScreenshotRestricted() rule that captureVisibleRegion() follows). The
+check runs for every copy, so a policy change stops the next copy.
+
+Viz's redaction of secure-output-only textures in copy passes
+(SurfaceAggregator, in_copy_request_pass) applies to these copies unchanged;
+the copy is an ordinary CopyOutputRequest on the guest's surface.
+
+Test: ControlledFrameTextureSourceTest.Ownership also checks that with
+screenshots disabled by policy a running source ends and a new one gets no
+frame.
+---
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -688,6 +688,7 @@
+ #include "extensions/browser/extension_config_map.h"
+ #include "extensions/browser/extension_config_map_factory.h"
+ #include "extensions/browser/extension_mojo_binder_registry.h"
++#include "extensions/browser/extensions_browser_client.h"
+ #include "extensions/browser/extension_mojo_binder_registry_factory.h"
+ #include "extensions/browser/extension_protocols.h"
+ #include "extensions/browser/extension_registry.h"
+@@ -10112,4 +10113,29 @@
+   return false;
++}
++
++bool ChromeContentBrowserClient::MayReadGuestFramePixels(
++    content::RenderFrameHost* embedder,
++    content::WebContents* guest_contents) {
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  // Only a <controlledframe> guest, read by the frame that owns it, in a
++  // context that has the Controlled Frame capability, and not when
++  // screenshots are restricted (the same policy as captureVisibleRegion()).
++  guest_view::GuestViewBase* guest =
++      guest_view::GuestViewBase::FromWebContents(guest_contents);
++  if (!guest || !guest->IsOwnedByControlledFrameEmbedder() ||
++      guest->owner_rfh() != embedder) {
++    return false;
++  }
++  if (!embedder->IsFeatureEnabled(
++          network::mojom::PermissionsPolicyFeature::kControlledFrame)) {
++    return false;
++  }
++  return extensions::ExtensionsBrowserClient::Get()
++      ->IsScreenshotRestricted(guest_contents)
++      .has_value();
++#else
++  return false;
++#endif
+ }
+ 
+ #if BUILDFLAG(IS_ANDROID)
+diff --git a/chrome/browser/chrome_content_browser_client.h b/chrome/browser/chrome_content_browser_client.h
+--- a/chrome/browser/chrome_content_browser_client.h
++++ b/chrome/browser/chrome_content_browser_client.h
+@@ -317,6 +317,8 @@
+   bool IsAndroidAdvancedProtectionEnabled() override;
+   bool IsFullscreenAllowedForUnfocusedWebContents(
+       content::WebContents* unfocused_web_contents) override;
++  bool MayReadGuestFramePixels(content::RenderFrameHost* embedder,
++                               content::WebContents* guest) override;
+   bool ShouldEnableStrictSiteIsolation() override;
+   std::optional<bool> GetOverrideValueForOriginKeyedProcesses() override;
+   bool ShouldDisableSiteIsolation(
+diff --git a/chrome/browser/controlled_frame/controlled_frame_apitest.cc b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+--- a/chrome/browser/controlled_frame/controlled_frame_apitest.cc
++++ b/chrome/browser/controlled_frame/controlled_frame_apitest.cc
+@@ -37,6 +37,7 @@
+ #include "components/guest_view/browser/test_guest_view_manager.h"
+ #include "components/policy/core/common/policy_pref_names.h"
+ #include "components/prefs/pref_service.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
+@@ -50,6 +51,9 @@
+ #include "content/public/test/browser_test.h"
+ #include "content/public/test/browser_test_utils.h"
+ #include "content/public/test/guest_frame_texture_test_util.h"
++#include "components/policy/core/common/policy_pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "net/dns/mock_host_resolver.h"
+ #include "content/public/test/no_renderer_crashes_assertion.h"
+ #include "content/public/test/test_navigation_observer.h"
+@@ -973,6 +977,36 @@
+       src.close();
+       return r;
+     })();)"));
++
++  // Screenshots disabled by policy (the rule captureVisibleRegion() follows):
++  // a running source ends at its next copy and a new one gets no frame.
++  ASSERT_EQ("green", content::EvalJs(app_frame, R"(
++    (async () => {
++      window.running = await document.querySelector('controlledframe')
++          .createTextureSource({width: 320, height: 40});
++      return readColor(running, 'green');
++    })();)"));
++  PrefService* prefs =
++      Profile::FromBrowserContext(app_frame->GetBrowserContext())->GetPrefs();
++  prefs->SetBoolean(policy::policy_prefs::kDisableScreenshots, true);
++  EXPECT_EQ("ended", content::EvalJs(app_frame, R"(
++    (async () => {
++      for (let i = 0; i < 100; i++) {
++        const vf = await running.read();
++        if (!vf) return 'ended';
++        vf.close();
++      }
++      return 'still reading';
++    })();)"));
++  EXPECT_EQ("no frame", content::EvalJs(app_frame, R"(
++    (async () => {
++      const src = await document.querySelector('controlledframe')
++          .createTextureSource({width: 320, height: 40});
++      const vf = await src.read();
++      if (vf) { vf.close(); return 'got a frame'; }
++      return 'no frame';
++    })();)"));
++  prefs->SetBoolean(policy::policy_prefs::kDisableScreenshots, false);
+ 
+   // A cross-origin iframe that is not a guest is refused (the source ends
+   // at once without a frame).
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+--- a/content/browser/renderer_host/guest_frame_texture_host.cc
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -28,6 +28,8 @@
+ #include "content/browser/renderer_host/render_frame_proxy_host.h"
+ #include "content/browser/renderer_host/render_widget_host_view_child_frame.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
++#include "content/public/browser/content_browser_client.h"
++#include "content/public/common/content_client.h"
+ #include "gpu/command_buffer/client/client_shared_image.h"
+ #include "gpu/command_buffer/client/shared_image_interface.h"
+ #include "gpu/command_buffer/common/shared_image_usage.h"
+@@ -284,6 +286,13 @@
+   }
+   auto* guest_contents = WebContentsImpl::FromFrameTreeNode(inner_root);
+   if (!guest_contents || !guest_contents->IsInnerWebContentsForGuest()) {
++    return nullptr;
++  }
++  // The embedder (Chrome) restricts this to <controlledframe> guests of
++  // frames with the Controlled Frame capability and applies the screenshot
++  // policy; checked for every copy, so a policy change stops the next one.
++  if (!GetContentClient()->browser()->MayReadGuestFramePixels(
++          caller, guest_contents)) {
+     return nullptr;
+   }
+   auto* view = inner_root->current_frame_host()->GetView();
+diff --git a/content/public/browser/content_browser_client.cc b/content/public/browser/content_browser_client.cc
+--- a/content/public/browser/content_browser_client.cc
++++ b/content/public/browser/content_browser_client.cc
+@@ -2123,6 +2123,11 @@
+   return false;
+ }
+ 
++bool ContentBrowserClient::MayReadGuestFramePixels(RenderFrameHost* embedder,
++                                                   WebContents* guest) {
++  return false;
++}
++
+ #if BUILDFLAG(IS_ANDROID)
+ bool ContentBrowserClient::ShouldAllowSystemUiPopups(
+     content::WebContents* web_contents) {
+diff --git a/content/public/browser/content_browser_client.h b/content/public/browser/content_browser_client.h
+--- a/content/public/browser/content_browser_client.h
++++ b/content/public/browser/content_browser_client.h
+@@ -477,6 +477,15 @@
+   virtual bool IsFullscreenAllowedForUnfocusedWebContents(
+       content::WebContents* unfocused_web_contents);
+ 
++  // Experiment: whether `embedder` may have viz copy the pixels of
++  // `guest` (an inner WebContents attached to a child frame of `embedder`)
++  // into GPU images it can read (GuestFrameTextureHost). Checked for every
++  // copy, after content's own ownership check. The embedder decides which
++  // kinds of guests qualify and applies its screenshot/capture policies. By
++  // default, returns false.
++  virtual bool MayReadGuestFramePixels(RenderFrameHost* embedder,
++                                       WebContents* guest);
++
+   // Returns whether SiteInstances matching the specified |security_principal|
+   // should share a single renderer process, rather than each getting its own
+   // process (the default process-per-site-instance mode).

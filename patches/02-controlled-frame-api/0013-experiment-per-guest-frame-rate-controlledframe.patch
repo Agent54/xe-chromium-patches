@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 15:39:21 +0000
+Subject: [PATCH 13/50] experiment: per-guest frame rate (controlledframe.setFrameRate)
+
+- viz.mojom.FrameSinkManager.SetFrameSinkThrottleInterval(sink, interval):
+  per-sink BeginFrame interval for a frame sink and its descendants, kept in
+  FrameSinkManagerImpl and applied after the existing throttling rules
+  (wins over Throttle()/global throttling and over capture); zero clears.
+- content::SetRenderWidgetHostFrameInterval(rwh, interval).
+- webViewInternal.setFrameRate(instanceId, fps) (owner frame only) and
+  HTMLControlledFrameElement.setFrameRate(fps); 0 restores the normal rate.
+---
+diff --git a/chrome/renderer/resources/controlled_frame/html_controlled_frame_element.js b/chrome/renderer/resources/controlled_frame/html_controlled_frame_element.js
+--- a/chrome/renderer/resources/controlled_frame/html_controlled_frame_element.js
++++ b/chrome/renderer/resources/controlled_frame/html_controlled_frame_element.js
+@@ -162,6 +162,31 @@
+         internal.viewInstanceId, names, callback);
+   }
+ 
++  // Experiment: limits the guest's frame (BeginFrame/rAF) rate;
++  // 0 restores the normal rate. Returns a Promise.
++  setFrameRate(framesPerSecond) {
++    let guestId;
++    try {
++      guestId = currentGuestId(this);
++    } catch (e) {
++      return rejectedPromise(e);
++    }
++    if (!guestId) {
++      return rejectedPromise(new Error('The frame has no guest'));
++    }
++    return new $Promise.self((resolve, reject) => {
++      WebViewInternal.setFrameRate(guestId, framesPerSecond, () => {
++        if (bindingUtil.hasLastError()) {
++          const error = bindingUtil.getLastErrorMessage();
++          bindingUtil.clearLastError();
++          reject(new Error(error));
++          return;
++        }
++        resolve();
++      });
++    });
++  }
++
+   // Experiment: returns a GuestFrameTextureSource whose read()
+   // resolves with VideoFrames backed by GPU shared images that the display
+   // compositor fills with the guest's pixels (no media capture device, no
+diff --git a/chrome/test/data/controlled_frame/resources/expected_properties.json b/chrome/test/data/controlled_frame/resources/expected_properties.json
+--- a/chrome/test/data/controlled_frame/resources/expected_properties.json
++++ b/chrome/test/data/controlled_frame/resources/expected_properties.json
+@@ -59,6 +59,7 @@
+     "request",
+     "setAudioMuted",
+     "setClientHintsUABrandEnabled",
++    "setFrameRate",
+     "setUserAgentOverride",
+     "setZoom",
+     "setZoomMode",
+diff --git a/components/viz/host/host_frame_sink_manager.cc b/components/viz/host/host_frame_sink_manager.cc
+--- a/components/viz/host/host_frame_sink_manager.cc
++++ b/components/viz/host/host_frame_sink_manager.cc
+@@ -475,6 +475,12 @@
+   screenshot_destinations_.erase(it);
+ }
+ 
++void HostFrameSinkManager::SetFrameSinkThrottleInterval(
++    const FrameSinkId& frame_sink_id,
++    base::TimeDelta interval) {
++  frame_sink_manager_->SetFrameSinkThrottleInterval(frame_sink_id, interval);
++}
++
+ void HostFrameSinkManager::Throttle(const std::vector<FrameSinkId>& ids,
+                                     base::TimeDelta interval) {
+   frame_sink_manager_->Throttle(ids, interval);
+diff --git a/components/viz/host/host_frame_sink_manager.h b/components/viz/host/host_frame_sink_manager.h
+--- a/components/viz/host/host_frame_sink_manager.h
++++ b/components/viz/host/host_frame_sink_manager.h
+@@ -328,6 +328,9 @@
+   void Throttle(const std::vector<FrameSinkId>& ids, base::TimeDelta interval);
+   void StartThrottlingAllFrameSinks(base::TimeDelta interval);
+   void StopThrottlingAllFrameSinks();
++  // Experiment, see mojom::FrameSinkManager.
++  void SetFrameSinkThrottleInterval(const FrameSinkId& frame_sink_id,
++                                    base::TimeDelta interval);
+ 
+   // HitTestDataProvider implementation.
+   void AddHitTestRegionObserver(HitTestRegionObserver* observer) override;
+diff --git a/components/viz/service/frame_sinks/frame_sink_manager_impl.cc b/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
+--- a/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
++++ b/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
+@@ -1339,6 +1339,17 @@
+   UpdateThrottling();
+ }
+ 
++void FrameSinkManagerImpl::SetFrameSinkThrottleInterval(
++    const FrameSinkId& frame_sink_id,
++    base::TimeDelta interval) {
++  if (interval.is_positive()) {
++    explicit_throttle_intervals_[frame_sink_id] = interval;
++  } else {
++    explicit_throttle_intervals_.erase(frame_sink_id);
++  }
++  UpdateThrottling();
++}
++
+ void FrameSinkManagerImpl::StopThrottlingAllFrameSinks() {
+   global_throttle_interval_ = std::nullopt;
+   UpdateThrottling();
+@@ -1380,6 +1391,16 @@
+   }
+ 
+   ApplyThrottlingRules(frame_sink_ids_to_throttle_, captured_frame_sink_ids_);
++
++  // Experiment: explicit per-sink intervals win, also over capture.
++  for (const auto& [root, interval] : explicit_throttle_intervals_) {
++    RecurseChildren(root, [this, interval](const FrameSinkId& frame_sink_id) {
++      if (auto* support = GetFrameSinkForId(frame_sink_id)) {
++        support->SetAllowThrottling(true);
++        support->SetThrottleInterval(interval);
++      }
++    });
++  }
+ }
+ 
+ bool FrameSinkManagerImpl::ThrottleIntervalHasEffect() const {
+diff --git a/components/viz/service/frame_sinks/frame_sink_manager_impl.h b/components/viz/service/frame_sinks/frame_sink_manager_impl.h
+--- a/components/viz/service/frame_sinks/frame_sink_manager_impl.h
++++ b/components/viz/service/frame_sinks/frame_sink_manager_impl.h
+@@ -211,6 +211,8 @@
+                 base::TimeDelta interval) override;
+   void StartThrottlingAllFrameSinks(base::TimeDelta interval) override;
+   void StopThrottlingAllFrameSinks() override;
++  void SetFrameSinkThrottleInterval(const FrameSinkId& frame_sink_id,
++                                    base::TimeDelta interval) override;
+   void ClearUnclaimedViewTransitionResources(
+       const blink::ViewTransitionToken& transition_token) override;
+   void CreateMetricsRecorderForTest(
+@@ -668,6 +670,8 @@
+ 
+   // Ids of the frame sinks that have been requested to throttle.
+   base::flat_set<FrameSinkId> frame_sink_ids_to_throttle_;
++  // Experiment: per-sink intervals set by SetFrameSinkThrottleInterval.
++  base::flat_map<FrameSinkId, base::TimeDelta> explicit_throttle_intervals_;
+ 
+   // The throttling interval which defines how often BeginFrames are sent for
+   // frame sinks in `frame_sink_ids_to_throttle_`, if
+diff --git a/components/viz/test/test_frame_sink_manager.h b/components/viz/test/test_frame_sink_manager.h
+--- a/components/viz/test/test_frame_sink_manager.h
++++ b/components/viz/test/test_frame_sink_manager.h
+@@ -94,6 +94,8 @@
+                 base::TimeDelta interval) override {}
+   void StartThrottlingAllFrameSinks(base::TimeDelta interval) override {}
+   void StopThrottlingAllFrameSinks() override {}
++  void SetFrameSinkThrottleInterval(const FrameSinkId& frame_sink_id,
++                                    base::TimeDelta interval) override {}
+   void ClearUnclaimedViewTransitionResources(
+       const blink::ViewTransitionToken& transition_token) override {}
+   void CreateMetricsRecorderForTest(
+diff --git a/content/browser/performance_manager/frame_rate_throttling.cc b/content/browser/performance_manager/frame_rate_throttling.cc
+--- a/content/browser/performance_manager/frame_rate_throttling.cc
++++ b/content/browser/performance_manager/frame_rate_throttling.cc
+@@ -53,4 +53,14 @@
+   GetHostFrameSinkManager()->Throttle(sink_ids_vector, interval);
+ }
+ 
++CONTENT_EXPORT void SetRenderWidgetHostFrameInterval(RenderWidgetHost* rwh,
++                                                     base::TimeDelta interval) {
++  CHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (!rwh || !GetHostFrameSinkManager()) {
++    return;
++  }
++  GetHostFrameSinkManager()->SetFrameSinkThrottleInterval(
++      static_cast<RenderWidgetHostImpl*>(rwh)->GetFrameSinkId(), interval);
++}
++
+ }  // namespace content
+diff --git a/content/public/browser/frame_rate_throttling.h b/content/public/browser/frame_rate_throttling.h
+--- a/content/public/browser/frame_rate_throttling.h
++++ b/content/public/browser/frame_rate_throttling.h
+@@ -52,6 +52,14 @@
+     const std::set<GlobalRenderFrameHostId>& throttle_frames,
+     base::TimeDelta interval);
+ 
++class RenderWidgetHost;
++
++// Experiment: sets the BeginFrame interval of `rwh`'s frame sink and
++// its descendants (zero clears it), independent of the other throttling
++// above and of capture.
++CONTENT_EXPORT void SetRenderWidgetHostFrameInterval(RenderWidgetHost* rwh,
++                                                     base::TimeDelta interval);
++
+ }  // namespace content
+ 
+ #endif  // CONTENT_PUBLIC_BROWSER_FRAME_RATE_THROTTLING_H_
+diff --git a/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc b/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
+--- a/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
++++ b/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
+@@ -24,6 +24,7 @@
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/desktop_media_id.h"
+ #include "content/public/browser/desktop_streams_registry.h"
++#include "content/public/browser/frame_rate_throttling.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/render_view_host.h"
+@@ -364,6 +365,26 @@
+           embedder_main_frame->GetRoutingID(), caller->GetLastCommittedOrigin(),
+           source, content::kRegistryStreamTypeDesktop);
+   return RespondNow(WithArguments(id));
++}
++
++ExtensionFunction::ResponseAction WebViewInternalSetFrameRateFunction::Run() {
++  std::optional<web_view_internal::SetFrameRate::Params> params =
++      web_view_internal::SetFrameRate::Params::Create(args());
++  EXTENSION_FUNCTION_VALIDATE(params);
++  WebViewGuest& guest = GetGuest();
++  content::RenderFrameHost* caller = render_frame_host();
++  if (!caller || !guest.attached() || guest.owner_rfh() != caller) {
++    return RespondNow(Error("Only the embedder of the guest can set its rate"));
++  }
++  content::RenderFrameHost* guest_main_frame = guest.GetGuestMainFrame();
++  if (!guest_main_frame || !guest_main_frame->GetRenderWidgetHost()) {
++    return RespondNow(Error("The guest has no widget"));
++  }
++  const double fps = params->frames_per_second;
++  content::SetRenderWidgetHostFrameInterval(
++      guest_main_frame->GetRenderWidgetHost(),
++      fps > 0 ? base::Seconds(1.0 / fps) : base::TimeDelta());
++  return RespondNow(NoArguments());
+ }
+ 
+ WebViewInternalCaptureVisibleRegionFunction::
+diff --git a/extensions/browser/api/guest_view/web_view/web_view_internal_api.h b/extensions/browser/api/guest_view/web_view/web_view_internal_api.h
+--- a/extensions/browser/api/guest_view/web_view/web_view_internal_api.h
++++ b/extensions/browser/api/guest_view/web_view/web_view_internal_api.h
+@@ -69,6 +69,26 @@
+   ResponseAction Run() override;
+ };
+ 
++// Experiment: sets the guest's BeginFrame interval.
++class WebViewInternalSetFrameRateFunction
++    : public WebViewInternalExtensionFunction {
++ public:
++  DECLARE_EXTENSION_FUNCTION("webViewInternal.setFrameRate",
++                             WEBVIEWINTERNAL_SETFRAMERATE)
++  WebViewInternalSetFrameRateFunction() = default;
++  WebViewInternalSetFrameRateFunction(
++      const WebViewInternalSetFrameRateFunction&) = delete;
++  WebViewInternalSetFrameRateFunction& operator=(
++      const WebViewInternalSetFrameRateFunction&) = delete;
++
++ protected:
++  ~WebViewInternalSetFrameRateFunction() override = default;
++
++ private:
++  // WebViewInternalExtensionFunction implementation.
++  ResponseAction Run() override;
++};
++
+ class WebViewInternalCaptureVisibleRegionFunction
+     : public WebViewInternalExtensionFunction,
+       public WebContentsCaptureClient {
+diff --git a/extensions/browser/extension_function_histogram_value.h b/extensions/browser/extension_function_histogram_value.h
+--- a/extensions/browser/extension_function_histogram_value.h
++++ b/extensions/browser/extension_function_histogram_value.h
+@@ -2060,6 +2060,7 @@
+   AUTOFILLPRIVATE_GETLOYALTYCARDLIST = 1995,
+   AUTOFILLPRIVATE_GETWALLETDIRECTOFFERLIST = 1996,
+   WEBVIEWINTERNAL_GETCAPTURESTREAMID = 1997,
++  WEBVIEWINTERNAL_SETFRAMERATE = 1998,
+   // Last entry: Add new entries above, then run:
+   // tools/metrics/histograms/update_extension_histograms.py
+   ENUM_BOUNDARY
+diff --git a/extensions/common/api/web_view_internal.json b/extensions/common/api/web_view_internal.json
+--- a/extensions/common/api/web_view_internal.json
++++ b/extensions/common/api/web_view_internal.json
+@@ -745,6 +745,26 @@
+         ]
+       },
+       {
++        "name": "setFrameRate",
++        "type": "function",
++        "description": "Experiment: limits the guest's BeginFrame (rAF) rate; 0 restores it. Only the guest's embedder frame may call this.",
++        "parameters": [
++          {
++            "type": "integer",
++            "name": "instanceId",
++            "description": "The instance ID of the guest <webview> process."
++          },
++          {
++            "type": "number",
++            "name": "framesPerSecond"
++          }
++        ],
++        "returns_async": {
++          "name": "callback",
++          "parameters": []
++        }
++      },
++      {
+         "name": "getCaptureStreamId",
+         "type": "function",
+         "description": "Registers a media stream id for capturing the guest's contents. Only the guest's embedder frame may call this and use the id.",
+diff --git a/services/viz/privileged/mojom/compositing/frame_sink_manager.mojom b/services/viz/privileged/mojom/compositing/frame_sink_manager.mojom
+--- a/services/viz/privileged/mojom/compositing/frame_sink_manager.mojom
++++ b/services/viz/privileged/mojom/compositing/frame_sink_manager.mojom
+@@ -207,6 +207,12 @@
+   Throttle(
+       array<FrameSinkId> frame_sink_ids, mojo_base.mojom.TimeDelta interval);
+ 
++  // Experiment: sets the BeginFrame interval of `frame_sink_id` and
++  // its descendant sinks, independently of Throttle() and of capture (zero
++  // clears it).
++  SetFrameSinkThrottleInterval(FrameSinkId frame_sink_id,
++                               mojo_base.mojom.TimeDelta interval);
++
+   // Throttles all current and future frame sinks to send BeginFrames at an
+   // interval at least as long as |interval|. Because there is a single viz
+   // process, which itself contains a single host frame sink manager, calling
+diff --git a/tools/metrics/histograms/metadata/extensions/enums.xml b/tools/metrics/histograms/metadata/extensions/enums.xml
+--- a/tools/metrics/histograms/metadata/extensions/enums.xml
++++ b/tools/metrics/histograms/metadata/extensions/enums.xml
+@@ -2952,6 +2952,7 @@
+   <int value="1995" label="AUTOFILLPRIVATE_GETLOYALTYCARDLIST"/>
+   <int value="1996" label="AUTOFILLPRIVATE_GETWALLETDIRECTOFFERLIST"/>
+   <int value="1997" label="WEBVIEWINTERNAL_GETCAPTURESTREAMID"/>
++  <int value="1998" label="WEBVIEWINTERNAL_SETFRAMERATE"/>
+ </enum>
+ 
+ <!-- LINT.ThenChange(//extensions/browser/extension_function_histogram_value.h:HistogramValue) -->

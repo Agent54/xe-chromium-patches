@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 14:44:54 +0000
+Subject: [PATCH 32/50] direct route hardening: hidden guests also when the source starts hidden
+
+- CrossProcessFrameConnector keeps the last FrameVisualProperties and, when
+  an inner WebContents' capturer count changes, re-applies them (so the
+  full-frame compositor viewport and surface keep-alive of the keep-alive
+  experiment take effect for a guest that was already scrolled out).
+- RenderWidgetHostViewChildFrame::CanBecomeVisible: the main frame of a
+  captured inner WebContents may become visible although its element is
+  visibility:hidden / display:none (kNotRendered), so capture started on an
+  already hidden guest makes it render.
+---
+diff --git a/content/browser/renderer_host/cross_process_frame_connector.cc b/content/browser/renderer_host/cross_process_frame_connector.cc
+--- a/content/browser/renderer_host/cross_process_frame_connector.cc
++++ b/content/browser/renderer_host/cross_process_frame_connector.cc
+@@ -63,6 +63,25 @@
+ }  // namespace
+ 
+ // static
++void CrossProcessFrameConnector::OnInnerWebContentsCaptureChanged(
++    WebContentsImpl* web_contents) {
++  FrameTreeNode* root = web_contents->GetPrimaryFrameTree().root();
++  RenderFrameProxyHost* proxy =
++      root ? root->render_manager()->GetProxyToOuterDelegate() : nullptr;
++  CrossProcessFrameConnector* connector =
++      proxy ? proxy->cross_process_frame_connector() : nullptr;
++  if (connector && connector->last_visual_properties_ &&
++      !web_contents->IsBeingDestroyed()) {
++    // Also updates the keep-alive.
++    blink::FrameVisualProperties properties =
++        *connector->last_visual_properties_;
++    connector->SynchronizeVisualProperties(properties, /*propagate=*/true);
++    return;
++  }
++  UpdateInnerSurfaceKeepAliveForCapture(web_contents);
++}
++
++// static
+ void CrossProcessFrameConnector::UpdateInnerSurfaceKeepAliveForCapture(
+     WebContentsImpl* web_contents) {
+   web_contents->RemoveUserData(kInnerSurfaceKeepAliveKey);
+@@ -237,6 +256,7 @@
+ void CrossProcessFrameConnector::SynchronizeVisualProperties(
+     const blink::FrameVisualProperties& visual_properties,
+     bool propagate) {
++  last_visual_properties_ = visual_properties;
+   last_received_zoom_level_ = visual_properties.zoom_level;
+   last_received_css_zoom_factor_ = visual_properties.css_zoom_factor;
+   last_received_local_frame_size_ = visual_properties.local_frame_size;
+diff --git a/content/browser/renderer_host/cross_process_frame_connector.h b/content/browser/renderer_host/cross_process_frame_connector.h
+--- a/content/browser/renderer_host/cross_process_frame_connector.h
++++ b/content/browser/renderer_host/cross_process_frame_connector.h
+@@ -7,6 +7,8 @@
+ 
+ #include <stdint.h>
+ 
++#include <optional>
++
+ #include "base/gtest_prod_util.h"
+ #include "base/memory/raw_ptr.h"
+ #include "cc/input/touch_action.h"
+@@ -101,6 +103,12 @@
+   // display:none, ...). Called when the capturer count or the surface changes.
+   static void UpdateInnerSurfaceKeepAliveForCapture(
+       WebContentsImpl* web_contents);
++
++  // Experiment: called when an inner WebContents' capturer count changes.
++  // Re-applies the last visual properties received from the embedder (so a
++  // guest that was already hidden or scrolled out when capture started gets
++  // the full compositor viewport) and updates the surface keep-alive.
++  static void OnInnerWebContentsCaptureChanged(WebContentsImpl* web_contents);
+ 
+   // |view| corresponds to B2's RenderWidgetHostViewChildFrame in the example
+   // above.
+@@ -306,6 +314,9 @@
+   // The last pre-transform frame size received from the parent renderer.
+   // |last_received_local_frame_size_| may be in DIP if use zoom for DSF is
+   // off.
++  // Experiment: the last visual properties received from the embedder.
++  std::optional<blink::FrameVisualProperties> last_visual_properties_;
++
+   gfx::Size last_received_local_frame_size_;
+ 
+   // The last zoom level received from parent renderer, which is used to check
+diff --git a/content/browser/renderer_host/render_widget_host_view_child_frame.cc b/content/browser/renderer_host/render_widget_host_view_child_frame.cc
+--- a/content/browser/renderer_host/render_widget_host_view_child_frame.cc
++++ b/content/browser/renderer_host/render_widget_host_view_child_frame.cc
+@@ -30,6 +30,7 @@
+ #include "content/browser/renderer_host/input/touch_selection_controller_input_observer.h"
+ #include "content/browser/renderer_host/render_view_host_impl.h"
+ #include "content/browser/renderer_host/render_widget_host_delegate.h"
++#include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/browser/renderer_host/render_widget_host_impl.h"
+ #include "content/browser/renderer_host/render_widget_host_view_event_handler.h"
+ #include "content/browser/renderer_host/text_input_manager.h"
+@@ -1261,8 +1262,18 @@
+   if (!frame_connector_)
+     return true;
+ 
+-  if (frame_connector_->IsHidden())
+-    return false;
++  if (frame_connector_->IsHidden()) {
++    // Experiment: the main frame of a captured inner WebContents (e.g. a
++    // guest read by a capture or a GuestFrameTextureSource) keeps rendering
++    // even if its element is visibility:hidden / display:none, also when the
++    // capture started while it was already hidden.
++    WebContentsImpl* contents = WebContentsImpl::FromRenderWidgetHostImpl(host());
++    if (!contents || !contents->IsBeingCaptured() ||
++        !contents->GetOuterWebContents() ||
++        contents->GetPrimaryMainFrame()->GetRenderWidgetHost() != host()) {
++      return false;
++    }
++  }
+ 
+   RenderWidgetHostViewBase* parent_view = GetParentViewInput();
+   if (!parent_view || !parent_view->IsRenderWidgetHostViewChildFrame()) {
+diff --git a/content/browser/web_contents/web_contents_impl.cc b/content/browser/web_contents/web_contents_impl.cc
+--- a/content/browser/web_contents/web_contents_impl.cc
++++ b/content/browser/web_contents/web_contents_impl.cc
+@@ -2903,7 +2903,7 @@
+   if (surface_embed_connector_) {
+     surface_embed_connector_->UpdateKeepSurfaceAlive();
+   }
+-  CrossProcessFrameConnector::UpdateInnerSurfaceKeepAliveForCapture(this);
++  CrossProcessFrameConnector::OnInnerWebContentsCaptureChanged(this);
+ }
+ 
+ #if BUILDFLAG(IS_MAC) && BUILDFLAG(USE_EXTERNAL_POPUP_MENU)

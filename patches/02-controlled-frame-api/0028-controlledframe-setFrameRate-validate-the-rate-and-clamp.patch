@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 20:18:03 +0000
+Subject: [PATCH 28/50] controlledframe.setFrameRate(): validate the rate and clamp the throttle interval
+
+setFrameRate() and GuestFrameTextureSource maxFrameRate turned a
+page-controlled number into a BeginFrame throttle interval without checking
+it. A value such as 1e-308 gives an infinite TimeDelta, which reached
+CompositorFrameSinkSupport and hit a CHECK in the Viz/GPU process (a remote
+crash of the GPU process).
+
+- setFrameRate(): reject anything but 0 or a finite rate in [0.5, 240].
+- GuestFrameTextureHost::CreateSource(): maxFrameRate arrives from the
+  renderer; refuse NaN, infinity and negative values, treat a rate above
+  240 as no cap and raise a tiny positive one to 0.5.
+- FrameSinkManagerImpl::SetFrameSinkThrottleInterval(): clamp the interval to
+  2 s as defense in depth.
+
+The hardcoded 55 Hz limit of the earlier commits is gone, so a cap of
+60 fps works on displays running at 120 Hz or more.
+---
+diff --git a/components/viz/service/frame_sinks/frame_sink_manager_impl.cc b/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
+--- a/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
++++ b/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
+@@ -1346,6 +1346,10 @@
+ void FrameSinkManagerImpl::SetFrameSinkThrottleInterval(
+     const FrameSinkId& frame_sink_id,
+     base::TimeDelta interval) {
++  // The interval is derived from page-controlled values. Never let an
++  // infinite or absurdly long interval reach CompositorFrameSinkSupport,
++  // where dividing by the vsync interval CHECKs on infinity.
++  interval = std::min(interval, base::Seconds(2));
+   if (interval.is_positive()) {
+     explicit_throttle_intervals_[frame_sink_id] = interval;
+   } else {
+diff --git a/content/browser/renderer_host/guest_frame_texture_host.cc b/content/browser/renderer_host/guest_frame_texture_host.cc
+--- a/content/browser/renderer_host/guest_frame_texture_host.cc
++++ b/content/browser/renderer_host/guest_frame_texture_host.cc
+@@ -5,6 +5,7 @@
+ #include "content/browser/renderer_host/guest_frame_texture_host.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <map>
+ #include <tuple>
+ #include <memory>
+@@ -37,6 +38,7 @@
+ #include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/document_user_data.h"
++#include "content/public/browser/frame_rate_throttling.h"
+ #include "content/public/browser/guest_frame_pixels_policy.h"
+ #include "content/public/browser/page.h"
+ #include "content/public/browser/web_contents_observer.h"
+@@ -731,6 +733,17 @@
+   if (size.IsEmpty() || size.width() > 8192 || size.height() > 8192 ||
+       pool_size < 2 || pool_size > 16) {
+     return refuse();
++  }
++  // `max_frame_rate` comes from the renderer: refuse NaN, infinity and
++  // negative values, treat rates above the limit as "no cap" and raise tiny
++  // ones to the minimum, so the interval derived from it is always finite.
++  if (!std::isfinite(max_frame_rate) || max_frame_rate < 0) {
++    return refuse();
++  }
++  if (max_frame_rate > kMaxGuestFrameRate) {
++    max_frame_rate = 0;
++  } else if (max_frame_rate > 0 && max_frame_rate < kMinGuestFrameRate) {
++    max_frame_rate = kMinGuestFrameRate;
+   }
+   WebContentsImpl* guest_contents = nullptr;
+   RenderWidgetHostViewChildFrame* view =
+diff --git a/content/public/browser/frame_rate_throttling.h b/content/public/browser/frame_rate_throttling.h
+--- a/content/public/browser/frame_rate_throttling.h
++++ b/content/public/browser/frame_rate_throttling.h
+@@ -64,6 +64,17 @@
+ CONTENT_EXPORT void SetGuestFrameInterval(WebContents* guest,
+                                           base::TimeDelta interval);
+ 
++// Frame rates accepted for a guest, from an embedder (setFrameRate()) or from
++// a renderer (GuestFrameTextureSource maxFrameRate). 0 means "no limit".
++inline constexpr double kMinGuestFrameRate = 0.5;
++inline constexpr double kMaxGuestFrameRate = 240.0;
++inline bool IsValidGuestFrameRate(double frames_per_second) {
++  // False for NaN and infinity.
++  return frames_per_second == 0 ||
++         (frames_per_second >= kMinGuestFrameRate &&
++          frames_per_second <= kMaxGuestFrameRate);
++}
++
+ }  // namespace content
+ 
+ #endif  // CONTENT_PUBLIC_BROWSER_FRAME_RATE_THROTTLING_H_
+diff --git a/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc b/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
+--- a/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
++++ b/extensions/browser/api/guest_view/web_view/web_view_internal_api.cc
+@@ -382,6 +382,12 @@
+   // The rate belongs to the guest: it follows the guest's main frame across
+   // navigations to other processes.
+   const double fps = params->frames_per_second;
++  // An unvalidated rate becomes a throttle interval in Viz: 1 / 1e-308 is
++  // infinite and used to hit a CHECK in the GPU process.
++  if (!content::IsValidGuestFrameRate(fps)) {
++    return RespondNow(
++        Error("The frame rate must be 0 or between 0.5 and 240"));
++  }
+   content::SetGuestFrameInterval(
+       guest.web_contents(),
+       fps > 0 ? base::Seconds(1.0 / fps) : base::TimeDelta());

@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xe Chromium Patches <noreply@xe.invalid>
+Date: Sun, 22 Nov 2026 19:27:15 +0000
+Subject: [PATCH 24/50] viz: count real subtree changes for parked copies; explicit intervals die with the sink
+
+Freshness bug: the parked-request release decided whether an aggregation
+was new content from the sink's own frame index plus a 'forced redraw
+pending' flag. A forced redraw that coincided with a change in an embedded
+surface only (e.g. the last frame of a video, with the guest's own frame
+unchanged) was treated as no change, so that final update was never copied.
+SurfaceAggregator now records, per surface walked, whether its own frame or
+any surface embedded in it has new damage
+(Surface::aggregated_content_changed(), set just before
+NotifyAggregatedDamage()); CompositorFrameSinkSupport counts only that, and
+the forced-redraw bookkeeping is gone. A null surface (unit tests) counts as
+a change; before, such tests crashed in OnSurfaceAggregatedDamage().
+
+FrameSinkManagerImpl::InvalidateFrameSinkId() also drops the sink's
+explicit throttle interval.
+
+(The other freshness item - back-pressure and setFrameRate() overwriting
+one entry - was fixed in aef1a60618: every rate request has an owner in
+content/browser/renderer_host/frame_sink_interval_registry.cc, the longest
+interval wins, and clearing one restores the others.)
+
+Two CompositorFrameSinkSupport tests that expect BeginFrames on the
+unshifted throttle grid now disable SpreadThrottledFrameSinkPhases; they
+failed since 84db50e495. viz_unittests *SurfaceAggregator*,
+*CompositorFrameSinkSupport*, *FrameSinkManager*, *CopyOutput* all pass.
+---
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -2006,6 +2006,11 @@
+ 
+   gfx::Rect damage_rect = resolved_frame.GetSurfaceDamage();
+ 
++  // Experiment: new content in this surface's own frame; embedded
++  // surfaces walked below add theirs.
++  const bool parent_subtree_content_changed = subtree_content_changed_;
++  subtree_content_changed_ = !damage_rect.IsEmpty();
++
+   // Avoid infinite recursion by adding current surface to
+   // |referenced_surfaces_|.
+   referenced_surfaces_.insert(surface->surface_id());
+@@ -2046,9 +2051,12 @@
+     // The following call can cause one or more copy requests to be added to the
+     // Surface. Therefore, no code before this point should have assumed
+     // anything about the presence or absence of copy requests after this point.
++    surface->set_aggregated_content_changed(subtree_content_changed_);
+     surface->NotifyAggregatedDamage(damage_rect_surface_space,
+                                     expected_display_time_);
+   }
++  subtree_content_changed_ =
++      parent_subtree_content_changed || subtree_content_changed_;
+ 
+   // If any CopyOutputRequests were made at FrameSink level, make sure we grab
+   // them too.
+diff --git a/components/viz/service/display/surface_aggregator.h b/components/viz/service/display/surface_aggregator.h
+--- a/components/viz/service/display/surface_aggregator.h
++++ b/components/viz/service/display/surface_aggregator.h
+@@ -428,6 +428,10 @@
+   // True if the frame that's currently being aggregated has copy requests.
+   // This is valid during Aggregate after PrewalkSurface is called.
+   bool has_copy_requests_ = false;
++  // Experiment: during PrewalkSurface(), whether the surface being
++  // walked or one embedded in it has new content (see
++  // Surface::aggregated_content_changed()).
++  bool subtree_content_changed_ = false;
+ 
+   // For each FrameSinkId, contains a vector of SurfaceRanges that will damage
+   // the display if they're damaged.
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+@@ -395,17 +395,15 @@
+   // video) changed in this aggregation. Release the oldest parked keyed
+   // request of each key; the aggregator takes copy requests from this sink
+   // right after this call, so the copy is of the frame being drawn now.
+-  // A redraw forced by a keyed request taken immediately (same frame, no
+-  // other change) is not new content.
+-  const uint64_t frame_index = surface->GetActiveFrameIndex();
+-  const bool new_frame = frame_index != last_aggregated_frame_index_;
+-  last_aggregated_frame_index_ = frame_index;
+-  const bool forced_only = !new_frame && forced_redraw_pending_;
+-  forced_redraw_pending_ = false;
+-  if (!forced_only) {
++  // Only new content counts: the sink's own new frame or a change in a
++  // surface embedded in it (e.g. a video), not a redraw of unchanged content
++  // (such as one forced by a keyed request taken immediately).
++  const bool content_changed =
++      !surface || surface->aggregated_content_changed();
++  if (content_changed) {
+     ++damage_count_;
+   }
+-  if (!forced_only && !deferred_copy_output_requests_.empty()) {
++  if (content_changed && !deferred_copy_output_requests_.empty()) {
+     base::flat_set<base::UnguessableToken> released_keys;
+     std::vector<std::unique_ptr<PendingCopyOutputRequest>> still_waiting;
+     for (auto& request : deferred_copy_output_requests_) {
+@@ -1497,7 +1495,6 @@
+       return;
+     }
+     last_copied_damage_by_key_[*key] = damage_count_;
+-    forced_redraw_pending_ = true;
+   }
+   copy_output_requests_.push_back(std::move(pending_copy_output_request));
+   if (last_activated_surface_id_.is_valid()) {
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.h b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.h
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+@@ -468,8 +468,6 @@
+   // Experiment: aggregations of this sink's surface with damage, and
+   // per wait key the value at its last copy.
+   uint64_t damage_count_ = 0;
+-  uint64_t last_aggregated_frame_index_ = 0;
+-  bool forced_redraw_pending_ = false;
+   base::flat_map<base::UnguessableToken, uint64_t> last_copied_damage_by_key_;
+ 
+   bool callback_received_begin_frame_ = true;
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support_unittest.cc b/components/viz/service/frame_sinks/compositor_frame_sink_support_unittest.cc
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support_unittest.cc
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support_unittest.cc
+@@ -2235,6 +2235,10 @@
+ 
+ TEST_P(CompositorFrameSinkSupportTest,
+        UsesThrottledIntervalInPresentationFeedback) {
++  // Experiment: this test expects BeginFrames on the unshifted
++  // throttle grid.
++  base::test::ScopedFeatureList no_phase_spreading;
++  no_phase_spreading.InitFromCommandLine("", "SpreadThrottledFrameSinkPhases");
+   static constexpr base::TimeDelta kThrottledFrameInterval = base::Hertz(5);
+   // Request BeginFrames.
+   support_->SetNeedsBeginFrame(true);
+@@ -2799,6 +2803,10 @@
+ 
+ TEST_P(CompositorFrameSinkSupportTest,
+        SendPresentationFeedbackOnlyInThrottledIntervalWhenThrottled) {
++  // Experiment: this test expects BeginFrames on the unshifted
++  // throttle grid.
++  base::test::ScopedFeatureList no_phase_spreading;
++  no_phase_spreading.InitFromCommandLine("", "SpreadThrottledFrameSinkPhases");
+   // Send PresentationFeedback with default interval when throttled can
+   // cause regression in https://crbug.com/405454652.
+   static constexpr base::TimeDelta kThrottledFrameInterval = base::Hertz(5);
+diff --git a/components/viz/service/frame_sinks/frame_sink_manager_impl.cc b/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
+--- a/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
++++ b/components/viz/service/frame_sinks/frame_sink_manager_impl.cc
+@@ -253,6 +253,8 @@
+   surface_manager_.InvalidateFrameSinkId(frame_sink_id);
+   if (video_detector_)
+     video_detector_->OnFrameSinkIdInvalidated(frame_sink_id);
++  // Experiment: an explicit interval does not outlive its sink.
++  explicit_throttle_intervals_.erase(frame_sink_id);
+ 
+   MaybeEraseHitTestQuery(frame_sink_id);
+ 
+diff --git a/components/viz/service/surfaces/surface.h b/components/viz/service/surfaces/surface.h
+--- a/components/viz/service/surfaces/surface.h
++++ b/components/viz/service/surfaces/surface.h
+@@ -244,6 +244,17 @@
+   void NotifyAggregatedDamage(const gfx::Rect& damage_rect,
+                               base::TimeTicks expected_display_time);
+ 
++  // Experiment: set by SurfaceAggregator just before
++  // NotifyAggregatedDamage(): whether this surface's own active frame or a
++  // surface embedded in it changed since the previous aggregation, as opposed
++  // to a redraw of unchanged content (e.g. one forced by a copy request).
++  void set_aggregated_content_changed(bool changed) {
++    aggregated_content_changed_ = changed;
++  }
++  bool aggregated_content_changed() const {
++    return aggregated_content_changed_;
++  }
++
+   // True if video capture has been started. False if it has been stopped.
+   // This information is used by direct composition overlays to decide whether
+   // overlay should be used. Not all frames have copy requests after video
+@@ -485,5 +496,7 @@
+   FrameActivationReason frame_activation_reason_ =
+       FrameActivationReason::kNotSet;
++
++  bool aggregated_content_changed_ = false;
+ 
+   base::WeakPtrFactory<Surface> weak_factory_{this};
+ };
